@@ -15,20 +15,25 @@ This project uses `uv` for dependency management (modern Python package manager)
 uv sync
 ```
 
-### Activate virtual environment
+### Running Python Commands
+
+**IMPORTANT**: All Python commands must be executed using the `.venv` virtual environment located in the project root.
+
+**Always use the virtual environment Python:**
 ```bash
-source .venv/bin/activate
+.venv/bin/python main.py
+.venv/bin/python sports_3d/homography/tennis.py
+.venv/bin/python -m sports_3d.utils.annotate_bbox image.png
+.venv/bin/python -m sports_3d.utils.label_keypoints image.png
 ```
 
-### Run the main script
+**Do NOT use:**
 ```bash
-python main.py
+python main.py  # ❌ Wrong - uses system Python, not venv
+uv run python main.py  # ❌ Wrong - do not use uv run
 ```
 
-### Run tennis court detection
-```bash
-python sports_3d/homography/tennis.py
-```
+The `.venv` directory is managed by `uv` but commands should directly invoke `.venv/bin/python`.
 
 ## Architecture
 
@@ -64,9 +69,13 @@ The `BallTrackerNet` is a fully convolutional network:
 ### File Structure
 
 - `checkpoints/model_tennis_court_det.pt` - Pre-trained model weights (42MB PyTorch checkpoint)
-- `data/` - Input images for processing
+- `data/` - Input images and videos for processing
 - `sports_3d/homography/` - Computer vision algorithms
-- `sports_3d/utils/` - Currently empty utility module
+- `sports_3d/utils/` - Annotation and utility tools:
+  - `annotation_base.py` - Base class for annotation tools
+  - `annotate_bbox.py` - Interactive bounding box labeling tool (YOLO format)
+  - `label_keypoints.py` - Interactive keypoint labeling tool
+  - `extract_frames.py` - Video frame extraction utility
 - `main.py` - Entry point (currently just prints hello world)
 
 ## Dependencies
@@ -89,6 +98,29 @@ Court keypoints (indices 0-13):
 - 4-7: Singles sideline intersections
 - 8-11: Service line intersections
 - 12-13: Net center points
+
+## Annotation Tools
+
+### Bounding Box Annotator
+```bash
+.venv/bin/python -m sports_3d.utils.annotate_bbox IMAGE_PATH [--class_id 0] [--output_dir PATH]
+```
+- Drag to draw bounding boxes
+- Saves in YOLO format: `class_id cx cy w h` (normalized coordinates)
+- Keyboard: D=delete last, S=save, Q=quit
+
+### Keypoint Labeler
+```bash
+.venv/bin/python -m sports_3d.utils.label_keypoints IMAGE_PATH [--output_dir PATH]
+```
+- Click to mark keypoint, then type index (0-13) in popup
+- Saves as: `index x y` (pixel coordinates)
+- Keyboard: D=delete last, S=save, Q=quit, ESC=cancel current point
+
+Both tools:
+- Support `--output_dir` for custom save location (defaults to image directory)
+- Event-driven rendering for responsive performance
+- Share common base class in `annotation_base.py`
 
 ## Coding Style Preferences
 

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run python:*)",
+      "Bash(.venv/bin/python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
