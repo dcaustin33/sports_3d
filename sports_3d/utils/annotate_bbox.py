@@ -68,15 +68,77 @@ class BBoxAnnotator(BaseAnnotator):
         self.drawing = False
         self.refine_tennis_ball = refine_tennis_ball
 
-    def mouse_callback(self, event, x, y, _flags, _param):
+        self.zoom_level = 1.0
+        self.zoom_center = (self.img_width / 2, self.img_height / 2)
+
+    def get_crop_region(self):
+        crop_width = self.img_width / self.zoom_level
+        crop_height = self.img_height / self.zoom_level
+        crop_x1 = self.zoom_center[0] - crop_width / 2
+        crop_y1 = self.zoom_center[1] - crop_height / 2
+
+        crop_x1 = max(0, min(crop_x1, self.img_width - crop_width))
+        crop_y1 = max(0, min(crop_y1, self.img_height - crop_height))
+
+        return crop_x1, crop_y1, crop_width, crop_height
+
+    def display_to_original(self, x, y):
+        if self.zoom_level == 1.0:
+            return x, y
+
+        crop_x1, crop_y1, _, _ = self.get_crop_region()
+        orig_x = crop_x1 + (x / self.zoom_level)
+        orig_y = crop_y1 + (y / self.zoom_level)
+
+        return orig_x, orig_y
+
+    def original_to_display(self, x, y):
+        if self.zoom_level == 1.0:
+            return x, y
+
+        crop_x1, crop_y1, _, _ = self.get_crop_region()
+        disp_x = (x - crop_x1) * self.zoom_level
+        disp_y = (y - crop_y1) * self.zoom_level
+
+        return disp_x, disp_y
+
+    def is_box_visible(self, box):
+        if self.zoom_level == 1.0:
+            return True
+
+        crop_x1, crop_y1, crop_width, crop_height = self.get_crop_region()
+        crop_x2 = crop_x1 + crop_width
+        crop_y2 = crop_y1 + crop_height
+
+        (x1, y1), (x2, y2) = box
+        box_x1, box_x2 = min(x1, x2), max(x1, x2)
+        box_y1, box_y2 = min(y1, y2), max(y1, y2)
+
+        return not (box_x2 < crop_x1 or box_x1 > crop_x2 or box_y2 < crop_y1 or box_y1 > crop_y2)
+
+    def mouse_callback(self, event, x, y, flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.drawing = True
-            self.current_box = [(x, y), (x, y)]
-            self.needs_redraw = True
+            if flags & cv2.EVENT_FLAG_CTRLKEY:
+                orig_x, orig_y = self.display_to_original(x, y)
+                self.zoom_center = (orig_x, orig_y)
+
+                zoom_levels = [1.0, 2.0, 4.0, 8.0, 12.0, 16.0]
+                current_idx = zoom_levels.index(self.zoom_level) if self.zoom_level in zoom_levels else 0
+                next_idx = (current_idx + 1) % len(zoom_levels)
+                self.zoom_level = zoom_levels[next_idx]
+
+                print(f"Zoom: {self.zoom_level}x at ({int(orig_x)}, {int(orig_y)})")
+                self.needs_redraw = True
+            else:
+                self.drawing = True
+                orig_x, orig_y = self.display_to_original(x, y)
+                self.current_box = [(orig_x, orig_y), (orig_x, orig_y)]
+                self.needs_redraw = True
 
         elif event == cv2.EVENT_MOUSEMOVE:
             if self.drawing and self.current_box:
-                self.current_box[1] = (x, y)
+                orig_x, orig_y = self.display_to_original(x, y)
+                self.current_box[1] = (orig_x, orig_y)
                 self.needs_redraw = True
 
         elif event == cv2.EVENT_LBUTTONUP:
@@ -84,7 +146,9 @@ class BBoxAnnotator(BaseAnnotator):
                 self.drawing = False
                 x1, y1 = self.current_box[0]
                 x2, y2 = self.current_box[1]
-                if abs(x2 - x1) > 5 and abs(y2 - y1) > 5:
+                disp_x1, disp_y1 = self.original_to_display(x1, y1)
+                disp_x2, disp_y2 = self.original_to_display(x2, y2)
+                if abs(disp_x2 - disp_x1) > 5 and abs(disp_y2 - disp_y1) > 5:
                     box_to_add = self.current_box
 
                     if self.refine_tennis_ball:
@@ -118,6 +182,9 @@ class BBoxAnnotator(BaseAnnotator):
         self.drawing = False
         self.needs_redraw = True
 
+        self.zoom_level = 1.0
+        self.zoom_center = (self.img_width / 2, self.img_height / 2)
+
         if self.batch_mode:
             print(f"\nAnnotating image {self.current_index + 1}/{self.total_images}: {self.image_path.name}")
 
@@ -139,34 +206,49 @@ class BBoxAnnotator(BaseAnnotator):
         return False
 
     def draw_display(self):
-        self.display_image = self.original_image.copy()
+        if self.zoom_level > 1.0:
+            crop_x1, crop_y1, crop_width, crop_height = self.get_crop_region()
+            x1, y1 = int(crop_x1), int(crop_y1)
+            x2, y2 = int(crop_x1 + crop_width), int(crop_y1 + crop_height)
+
+            cropped = self.original_image[y1:y2, x1:x2]
+            self.display_image = cv2.resize(cropped, (self.img_width, self.img_height), interpolation=cv2.INTER_LINEAR)
+        else:
+            self.display_image = self.original_image.copy()
 
         for box in self.boxes:
-            self.draw_box(box, (0, 255, 0), 2)
+            if self.is_box_visible(box):
+                self.draw_box(box, (0, 255, 0), 2)
 
         if self.current_box:
-            self.draw_box(self.current_box, (0, 255, 255), 2)
+            if self.is_box_visible(self.current_box):
+                self.draw_box(self.current_box, (0, 255, 255), 2)
 
         mode = "Tennis Ball (Auto-Refine)" if self.refine_tennis_ball else "Standard"
+        zoom_info = f" | Zoom: {self.zoom_level}x" if self.zoom_level > 1.0 else ""
         if self.batch_mode:
             instructions = [
-                f"Image {self.current_index + 1}/{self.total_images} | Boxes: {len(self.boxes)} | Class: {self.class_id} | Mode: {mode}",
+                f"Image {self.current_index + 1}/{self.total_images} | Boxes: {len(self.boxes)} | Class: {self.class_id} | Mode: {mode}{zoom_info}",
                 f"Processed: {self.processed_count} | Skipped: {self.skipped_count}",
-                "Drag: Box | D: Delete | S: Save+Next | N: Skip | P: Previous | Q: Quit"
+                "Drag: Box | D: Delete | S: Save+Next | N: Skip | P: Previous | R: Reset Zoom | Q: Quit"
             ]
         else:
             instructions = [
-                f"Boxes: {len(self.boxes)} | Class ID: {self.class_id} | Mode: {mode}",
-                "Drag: Draw box | D: Delete last | S: Save | Q: Quit"
+                f"Boxes: {len(self.boxes)} | Class ID: {self.class_id} | Mode: {mode}{zoom_info}",
+                "Drag: Draw box | D: Delete last | S: Save | R: Reset Zoom | Q: Quit"
             ]
         self.draw_instructions_overlay(instructions)
 
     def draw_box(self, box, color, thickness):
         (x1, y1), (x2, y2) = box
-        cv2.rectangle(self.display_image, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
 
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
+        disp_x1, disp_y1 = self.original_to_display(x1, y1)
+        disp_x2, disp_y2 = self.original_to_display(x2, y2)
+
+        cv2.rectangle(self.display_image, (int(disp_x1), int(disp_y1)), (int(disp_x2), int(disp_y2)), color, thickness)
+
+        cx = (disp_x1 + disp_x2) / 2
+        cy = (disp_y1 + disp_y2) / 2
         cv2.circle(self.display_image, (int(cx), int(cy)), 3, color, -1)
 
     def box_to_yolo(self, box):
@@ -221,11 +303,12 @@ class BBoxAnnotator(BaseAnnotator):
         else:
             print("Mode: Standard bounding box annotation")
         print("Drag to draw bounding boxes")
+        print("Ctrl+Click to zoom (progressive 2x/4x/8x/12x/16x), 'R' to reset zoom")
 
         if self.batch_mode:
-            print("Press 'S' to save+next, 'N' to skip, 'P' for previous, 'D' to delete last, 'Q' to quit\n")
+            print("Press 'S' to save+next, 'N' to skip, 'P' for previous, 'D' to delete last, 'R' to reset zoom, 'Q' to quit\n")
         else:
-            print("Press 'D' to delete last, 'S' to save, 'Q' to quit\n")
+            print("Press 'D' to delete last, 'S' to save, 'R' to reset zoom, 'Q' to quit\n")
 
         while True:
             if self.needs_redraw:
@@ -261,6 +344,12 @@ class BBoxAnnotator(BaseAnnotator):
                     self.load_previous_image()
             elif key == ord('d') or key == ord('D'):
                 self.delete_last()
+            elif key == ord('r') or key == ord('R'):
+                if self.zoom_level != 1.0:
+                    self.zoom_level = 1.0
+                    self.zoom_center = (self.img_width / 2, self.img_height / 2)
+                    print("Zoom reset to 1.0x")
+                    self.needs_redraw = True
 
         self.cleanup()
 

@@ -20,7 +20,8 @@ def _detect_ball_hough(roi: np.ndarray, params: dict) -> Optional[tuple]:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
-    blurred = cv2.GaussianBlur(enhanced, (5, 5), 1.5)
+    # Bilateral filter preserves ball edges while smoothing text
+    blurred = cv2.bilateralFilter(enhanced, 9, 75, 75)
 
     roi_h, roi_w = roi.shape[:2]
     min_dist = max(roi_w, roi_h) // 2
@@ -31,7 +32,7 @@ def _detect_ball_hough(roi: np.ndarray, params: dict) -> Optional[tuple]:
         dp=1,
         minDist=min_dist,
         param1=50,
-        param2=20,
+        param2=25,  # Slightly higher threshold for stronger circle evidence
         minRadius=params['minRadius'],
         maxRadius=params['maxRadius']
     )
@@ -66,10 +67,15 @@ def _detect_ball_color(roi: np.ndarray, params: dict) -> Optional[tuple]:
     """
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    lower_yellow = np.array([25, 50, 50])
-    upper_yellow = np.array([85, 255, 255])
+    # Hue 25-85 covers yellow-green range typical of tennis balls
+    lower_green_yellow = np.array([25, 50, 50])
+    upper_green_yellow = np.array([85, 255, 255])
 
-    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    mask = cv2.inRange(hsv, lower_green_yellow, upper_green_yellow)
+
+    # Fill holes from black text with morphological closing
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -83,7 +89,7 @@ def _detect_ball_color(roi: np.ndarray, params: dict) -> Optional[tuple]:
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 100:
+        if area < 10:
             continue
 
         (x, y), radius = cv2.minEnclosingCircle(contour)
@@ -91,10 +97,14 @@ def _detect_ball_color(roi: np.ndarray, params: dict) -> Optional[tuple]:
         if not (params['minRadius'] <= radius <= params['maxRadius']):
             continue
 
-        perimeter = cv2.arcLength(contour, True)
-        if perimeter == 0:
+        # Use convex hull for circularity to handle irregular contours from text
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        hull_perimeter = cv2.arcLength(hull, True)
+        
+        if hull_perimeter == 0:
             continue
-        circularity = 4 * np.pi * area / (perimeter ** 2)
+        circularity = 4 * np.pi * hull_area / (hull_perimeter ** 2)
 
         center_dist = np.sqrt((x - roi_center[0])**2 + (y - roi_center[1])**2)
         score = circularity * area / (center_dist + 1)
@@ -104,6 +114,22 @@ def _detect_ball_color(roi: np.ndarray, params: dict) -> Optional[tuple]:
             best_contour = (float(x), float(y), float(radius))
 
     return best_contour if best_score > 0 else None
+
+def refine_with_edges(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        # Combine all edge points
+        all_points = np.vstack(contours)
+        (x, y), radius = cv2.minEnclosingCircle(all_points)
+        x, y, radius = int(x), int(y), int(radius)
+        return (x-radius, y-radius, 2*radius, 2*radius)
+    
+    return None
 
 
 def refined_tennis_ball_box(
@@ -116,11 +142,9 @@ def refined_tennis_ball_box(
     Args:
         box: Bounding box [(x1, y1), (x2, y2)] in pixel coordinates
         image: Image array in BGR format (OpenCV standard)
-        min_ball_size: Minimum expected ball radius in pixels
-        max_ball_size: Maximum expected ball radius in pixels
 
     Returns:
-        Refined box [(x1, y1), (x2, y2)] or original box if refinement fails
+        Refined box [(x1, y1), (x2, y2)] or original box if all refinement methods fail
     """
     (x1, y1), (x2, y2) = box
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -145,12 +169,25 @@ def refined_tennis_ball_box(
     }
 
     result = _detect_ball_hough(roi, params)
-    print("result", result)
 
     if result is None:
         result = _detect_ball_color(roi, params)
 
     if result is None:
+        edge_box = refine_with_edges(roi)
+        if edge_box is not None:
+            edge_x1, edge_y1, edge_w, edge_h = edge_box
+            refined_x1 = int(max(x1, x1 + edge_x1))
+            refined_y1 = int(max(y1, y1 + edge_y1))
+            refined_x2 = int(min(x2, x1 + edge_x1 + edge_w))
+            refined_y2 = int(min(y2, y1 + edge_y1 + edge_h))
+
+            original_area = (x2 - x1) * (y2 - y1)
+            refined_area = (refined_x2 - refined_x1) * (refined_y2 - refined_y1)
+
+            if refined_area <= original_area * 1.05 and refined_area >= original_area * 0.3:
+                return [(refined_x1, refined_y1), (refined_x2, refined_y2)]
+
         return box
 
     cx_roi, cy_roi, radius = result
@@ -160,10 +197,10 @@ def refined_tennis_ball_box(
     margin = 1.03
     refined_radius = radius * margin
 
-    refined_x1 = int(max(0, cx_img - refined_radius))
-    refined_y1 = int(max(0, cy_img - refined_radius))
-    refined_x2 = int(min(w, cx_img + refined_radius))
-    refined_y2 = int(min(h, cy_img + refined_radius))
+    refined_x1 = int(max(x1, cx_img - refined_radius))
+    refined_y1 = int(max(y1, cy_img - refined_radius))
+    refined_x2 = int(min(x2, cx_img + refined_radius))
+    refined_y2 = int(min(y2, cy_img + refined_radius))
 
     original_area = (x2 - x1) * (y2 - y1)
     refined_area = (refined_x2 - refined_x1) * (refined_y2 - refined_y1)
