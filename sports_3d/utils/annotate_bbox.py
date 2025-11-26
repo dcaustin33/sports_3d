@@ -28,11 +28,13 @@ class BBoxAnnotator(BaseAnnotator):
         annotation_file = output_dir / f"{image_path.stem}_bbox.txt"
         return annotation_file.exists()
 
-    def __init__(self, image_path: str, class_id: int = 0, output_dir: str = None, refine_tennis_ball: bool = False):
+    def __init__(self, image_path: str, class_id: int = 0, output_dir: str = None, refine_tennis_ball: bool = False, refine_current_boxes: bool = False):
         input_path = Path(image_path)
 
         self.output_dir = Path(output_dir) if output_dir else (input_path if input_path.is_dir() else input_path.parent)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.refine_current_boxes = refine_current_boxes
 
         self.image_queue = self._discover_images(input_path)
         self.batch_mode = len(self.image_queue) > 1
@@ -46,14 +48,24 @@ class BBoxAnnotator(BaseAnnotator):
         if not self.image_queue:
             raise ValueError(f"No images found in {input_path}")
 
-        for i, img_path in enumerate(self.image_queue):
-            if not self._is_already_annotated(img_path, self.output_dir):
-                self.current_index = i
-                break
+        if self.refine_current_boxes:
+            for i, img_path in enumerate(self.image_queue):
+                if self._is_already_annotated(img_path, self.output_dir):
+                    self.current_index = i
+                    break
+            else:
+                if self.is_directory:
+                    print("No annotated images found to refine")
+                    raise SystemExit(0)
         else:
-            if self.is_directory:
-                print("All images already annotated")
-                raise SystemExit(0)
+            for i, img_path in enumerate(self.image_queue):
+                if not self._is_already_annotated(img_path, self.output_dir):
+                    self.current_index = i
+                    break
+            else:
+                if self.is_directory:
+                    print("All images already annotated")
+                    raise SystemExit(0)
 
         self.already_annotated_count = sum(
             1 for img in self.image_queue if self._is_already_annotated(img, self.output_dir)
@@ -70,6 +82,17 @@ class BBoxAnnotator(BaseAnnotator):
 
         self.zoom_level = 1.0
         self.zoom_center = (self.img_width / 2, self.img_height / 2)
+
+        self.in_refine_mode = False
+        self.refine_temp_box = None
+        self.refine_original_zoom = None
+        self.refine_original_zoom_center = None
+
+        self.refining_existing_boxes = False
+        self.box_refine_queue = []
+        self.current_refine_index = 0
+
+        self.load_image(self.image_queue[self.current_index])
 
     def get_crop_region(self):
         crop_width = self.img_width / self.zoom_level
@@ -116,9 +139,136 @@ class BBoxAnnotator(BaseAnnotator):
 
         return not (box_x2 < crop_x1 or box_x1 > crop_x2 or box_y2 < crop_y1 or box_y1 > crop_y2)
 
+    def yolo_to_box(self, yolo_line: str):
+        parts = yolo_line.strip().split()
+        if len(parts) != 5:
+            return None
+
+        class_id, cx, cy, w, h = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+
+        cx_px = cx * self.img_width
+        cy_px = cy * self.img_height
+        w_px = w * self.img_width
+        h_px = h * self.img_height
+
+        x1 = cx_px - w_px / 2
+        y1 = cy_px - h_px / 2
+        x2 = cx_px + w_px / 2
+        y2 = cy_px + h_px / 2
+
+        return [(x1, y1), (x2, y2)]
+
+    def load_existing_annotations(self, image_path: Path):
+        annotation_file = self.output_dir / f"{image_path.stem}_bbox.txt"
+        if not annotation_file.exists():
+            return []
+
+        boxes = []
+        with open(annotation_file, 'r') as f:
+            for line in f:
+                box = self.yolo_to_box(line)
+                if box:
+                    boxes.append(box)
+
+        return boxes
+
+    def zoom_to_box(self, box, expansion_factor=1.3):
+        (x1, y1), (x2, y2) = box
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+
+        box_width = (x2 - x1) * expansion_factor
+        box_height = (y2 - y1) * expansion_factor
+
+        zoom_x = self.img_width / box_width
+        zoom_y = self.img_height / box_height
+        zoom_level = min(zoom_x, zoom_y)
+
+        zoom_level = max(1.0, min(zoom_level, 16.0))
+
+        return zoom_level, (cx, cy)
+
+    def enter_refine_mode(self, box):
+        self.refine_original_zoom = self.zoom_level
+        self.refine_original_zoom_center = self.zoom_center
+        self.refine_temp_box = box
+        self.in_refine_mode = True
+
+        new_zoom, new_center = self.zoom_to_box(box, expansion_factor=1.3)
+        self.zoom_level = new_zoom
+        self.zoom_center = new_center
+
+        print(f"Refine mode: Draw new box or press 'S' to accept, 'Q' to discard")
+
+    def exit_refine_mode(self, accept=False):
+        if accept and self.refine_temp_box:
+            self.boxes.append(self.refine_temp_box)
+            print(f"Box accepted. Total boxes: {len(self.boxes)}")
+        else:
+            if self.refining_existing_boxes:
+                original_box = self.box_refine_queue[self.current_refine_index]
+                self.boxes.append(original_box)
+                print("Box discarded, kept original")
+            else:
+                print("Box discarded")
+
+        self.zoom_level = self.refine_original_zoom
+        self.zoom_center = self.refine_original_zoom_center
+
+        self.refine_temp_box = None
+        self.in_refine_mode = False
+        self.refine_original_zoom = None
+        self.refine_original_zoom_center = None
+
+        self.needs_redraw = True
+
+        if self.refining_existing_boxes:
+            self.current_refine_index += 1
+            if not self.refine_next_box_in_queue():
+                pass
+
+    def start_refining_existing_boxes(self):
+        if not self.boxes:
+            print("No boxes to refine")
+            return False
+
+        self.refining_existing_boxes = True
+        self.box_refine_queue = self.boxes.copy()
+        self.current_refine_index = 0
+        self.boxes = []
+
+        return self.refine_next_box_in_queue()
+
+    def refine_next_box_in_queue(self):
+        if self.current_refine_index >= len(self.box_refine_queue):
+            self.refining_existing_boxes = False
+            print(f"All {len(self.box_refine_queue)} boxes refined")
+            return False
+
+        box = self.box_refine_queue[self.current_refine_index]
+
+        if self.refine_tennis_ball:
+            print(f"Auto-refining box {self.current_refine_index + 1}/{len(self.box_refine_queue)}...")
+            refined_box = refined_tennis_ball_box(box, self.original_image)
+            if refined_box != box:
+                print("Box auto-refined successfully")
+                box = refined_box
+            else:
+                print("Auto-refinement unchanged, using original")
+
+        self.enter_refine_mode(box)
+        print(f"Refining box {self.current_refine_index + 1}/{len(self.box_refine_queue)}")
+        return True
+
     def mouse_callback(self, event, x, y, flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
             if flags & cv2.EVENT_FLAG_CTRLKEY:
+                if self.in_refine_mode:
+                    print("Manual zoom disabled in refine mode")
+                    return
                 orig_x, orig_y = self.display_to_original(x, y)
                 self.zoom_center = (orig_x, orig_y)
 
@@ -162,8 +312,15 @@ class BBoxAnnotator(BaseAnnotator):
                         else:
                             print(f"Could not refine box, using original")
 
-                    self.boxes.append(box_to_add)
-                    print(f"Box added. Total boxes: {len(self.boxes)}")
+                    if self.in_refine_mode:
+                        self.refine_temp_box = box_to_add
+                        print(f"Box replaced in refine mode")
+                    else:
+                        if self.refine_tennis_ball:
+                            self.enter_refine_mode(box_to_add)
+                        else:
+                            self.boxes.append(box_to_add)
+                            print(f"Box added. Total boxes: {len(self.boxes)}")
                 self.current_box = None
                 self.needs_redraw = True
 
@@ -177,7 +334,12 @@ class BBoxAnnotator(BaseAnnotator):
         self.display_image = self.image.copy()
         self.img_height, self.img_width = self.image.shape[:2]
 
-        self.boxes = []
+        if self.refine_current_boxes:
+            self.boxes = self.load_existing_annotations(image_path)
+            print(f"Loaded {len(self.boxes)} existing boxes")
+        else:
+            self.boxes = []
+
         self.current_box = None
         self.drawing = False
         self.needs_redraw = True
@@ -185,24 +347,44 @@ class BBoxAnnotator(BaseAnnotator):
         self.zoom_level = 1.0
         self.zoom_center = (self.img_width / 2, self.img_height / 2)
 
+        self.in_refine_mode = False
+        self.refine_temp_box = None
+        self.refine_original_zoom = None
+        self.refine_original_zoom_center = None
+
         if self.batch_mode:
             print(f"\nAnnotating image {self.current_index + 1}/{self.total_images}: {self.image_path.name}")
 
+        if self.refine_current_boxes and self.boxes:
+            self.start_refining_existing_boxes()
+
     def load_next_image(self) -> bool:
         for i in range(self.current_index + 1, self.total_images):
-            if not self._is_already_annotated(self.image_queue[i], self.output_dir):
-                self.current_index = i
-                self.load_image(self.image_queue[i])
-                return True
+            if self.refine_current_boxes:
+                if self._is_already_annotated(self.image_queue[i], self.output_dir):
+                    self.current_index = i
+                    self.load_image(self.image_queue[i])
+                    return True
+            else:
+                if not self._is_already_annotated(self.image_queue[i], self.output_dir):
+                    self.current_index = i
+                    self.load_image(self.image_queue[i])
+                    return True
         return False
 
     def load_previous_image(self) -> bool:
         for i in range(self.current_index - 1, -1, -1):
-            if not self._is_already_annotated(self.image_queue[i], self.output_dir):
-                self.current_index = i
-                self.load_image(self.image_queue[i])
-                return True
-        print("Already at first unannotated image")
+            if self.refine_current_boxes:
+                if self._is_already_annotated(self.image_queue[i], self.output_dir):
+                    self.current_index = i
+                    self.load_image(self.image_queue[i])
+                    return True
+            else:
+                if not self._is_already_annotated(self.image_queue[i], self.output_dir):
+                    self.current_index = i
+                    self.load_image(self.image_queue[i])
+                    return True
+        print("Already at first unannotated image" if not self.refine_current_boxes else "Already at first annotated image")
         return False
 
     def draw_display(self):
@@ -216,27 +398,45 @@ class BBoxAnnotator(BaseAnnotator):
         else:
             self.display_image = self.original_image.copy()
 
-        for box in self.boxes:
-            if self.is_box_visible(box):
-                self.draw_box(box, (0, 255, 0), 2)
+        if self.in_refine_mode:
+            if self.refine_temp_box and self.is_box_visible(self.refine_temp_box):
+                self.draw_box(self.refine_temp_box, (0, 255, 255), 3)
 
-        if self.current_box:
-            if self.is_box_visible(self.current_box):
-                self.draw_box(self.current_box, (0, 255, 255), 2)
+            if self.current_box and self.is_box_visible(self.current_box):
+                self.draw_box(self.current_box, (255, 255, 0), 2)
 
-        mode = "Tennis Ball (Auto-Refine)" if self.refine_tennis_ball else "Standard"
-        zoom_info = f" | Zoom: {self.zoom_level}x" if self.zoom_level > 1.0 else ""
-        if self.batch_mode:
-            instructions = [
-                f"Image {self.current_index + 1}/{self.total_images} | Boxes: {len(self.boxes)} | Class: {self.class_id} | Mode: {mode}{zoom_info}",
-                f"Processed: {self.processed_count} | Skipped: {self.skipped_count}",
-                "Drag: Box | D: Delete | S: Save+Next | N: Skip | P: Previous | R: Reset Zoom | Q: Quit"
-            ]
+            if self.refining_existing_boxes:
+                instructions = [
+                    f"REFINE MODE | Box {self.current_refine_index + 1}/{len(self.box_refine_queue)} | Zoom: {self.zoom_level:.1f}x",
+                    "Drag: Redraw box | S: Accept & Next | Q: Keep original & Next"
+                ]
+            else:
+                instructions = [
+                    f"REFINE MODE | Zoom: {self.zoom_level:.1f}x",
+                    "Drag: Redraw box | S: Accept | Q: Discard"
+                ]
         else:
-            instructions = [
-                f"Boxes: {len(self.boxes)} | Class ID: {self.class_id} | Mode: {mode}{zoom_info}",
-                "Drag: Draw box | D: Delete last | S: Save | R: Reset Zoom | Q: Quit"
-            ]
+            for box in self.boxes:
+                if self.is_box_visible(box):
+                    self.draw_box(box, (0, 255, 0), 2)
+
+            if self.current_box:
+                if self.is_box_visible(self.current_box):
+                    self.draw_box(self.current_box, (0, 255, 255), 2)
+
+            mode = "Tennis Ball (Auto-Refine)" if self.refine_tennis_ball else "Standard"
+            zoom_info = f" | Zoom: {self.zoom_level}x" if self.zoom_level > 1.0 else ""
+            if self.batch_mode:
+                instructions = [
+                    f"Image {self.current_index + 1}/{self.total_images} | Boxes: {len(self.boxes)} | Class: {self.class_id} | Mode: {mode}{zoom_info}",
+                    f"Processed: {self.processed_count} | Skipped: {self.skipped_count}",
+                    "Drag: Box | D: Delete | S: Save+Next | N: Skip | P: Previous | R: Reset Zoom | Q: Quit"
+                ]
+            else:
+                instructions = [
+                    f"Boxes: {len(self.boxes)} | Class ID: {self.class_id} | Mode: {mode}{zoom_info}",
+                    "Drag: Draw box | D: Delete last | S: Save | R: Reset Zoom | Q: Quit"
+                ]
         self.draw_instructions_overlay(instructions)
 
     def draw_box(self, box, color, thickness):
@@ -297,13 +497,20 @@ class BBoxAnnotator(BaseAnnotator):
         else:
             print(f"\nAnnotating image: {self.image_path}")
 
-        if self.refine_tennis_ball:
+        if self.refine_current_boxes:
+            print("Mode: REFINE EXISTING BOXES")
+            if self.refine_tennis_ball:
+                print("  - Auto-refinement ENABLED (boxes will be refined automatically)")
+            print("  - Each box will be shown sequentially for review/refinement")
+        elif self.refine_tennis_ball:
             print("Mode: Tennis Ball Auto-Refinement ENABLED")
             print("Draw rough boxes around balls - they'll be automatically refined using Hough + color detection")
         else:
             print("Mode: Standard bounding box annotation")
-        print("Drag to draw bounding boxes")
-        print("Ctrl+Click to zoom (progressive 2x/4x/8x/12x/16x), 'R' to reset zoom")
+
+        if not self.refine_current_boxes:
+            print("Drag to draw bounding boxes")
+            print("Ctrl+Click to zoom (progressive 2x/4x/8x/12x/16x), 'R' to reset zoom")
 
         if self.batch_mode:
             print("Press 'S' to save+next, 'N' to skip, 'P' for previous, 'D' to delete last, 'R' to reset zoom, 'Q' to quit\n")
@@ -319,33 +526,48 @@ class BBoxAnnotator(BaseAnnotator):
             key = cv2.waitKey(20) & 0xFF
 
             if key == ord('q') or key == ord('Q'):
-                if self.batch_mode:
-                    self.print_batch_summary()
+                if self.in_refine_mode:
+                    self.exit_refine_mode(accept=False)
                 else:
-                    print("Quitting without saving")
-                break
-            elif key == ord('s') or key == ord('S'):
-                if self.save_annotations():
                     if self.batch_mode:
-                        self.processed_count += 1
-                        if not self.load_next_image():
-                            self.print_batch_summary()
-                            break
+                        self.print_batch_summary()
                     else:
-                        break
+                        print("Quitting without saving")
+                    break
+            elif key == ord('s') or key == ord('S'):
+                if self.in_refine_mode:
+                    self.exit_refine_mode(accept=True)
+                else:
+                    if self.save_annotations():
+                        if self.batch_mode:
+                            self.processed_count += 1
+                            if not self.load_next_image():
+                                self.print_batch_summary()
+                                break
+                        else:
+                            break
             elif key == ord('n') or key == ord('N'):
-                if self.batch_mode:
+                if self.in_refine_mode:
+                    print("Skip disabled in refine mode")
+                elif self.batch_mode:
                     self.skipped_count += 1
                     if not self.load_next_image():
                         self.print_batch_summary()
                         break
             elif key == ord('p') or key == ord('P'):
-                if self.batch_mode:
+                if self.in_refine_mode:
+                    print("Previous disabled in refine mode")
+                elif self.batch_mode:
                     self.load_previous_image()
             elif key == ord('d') or key == ord('D'):
-                self.delete_last()
+                if self.in_refine_mode:
+                    print("Delete disabled in refine mode")
+                else:
+                    self.delete_last()
             elif key == ord('r') or key == ord('R'):
-                if self.zoom_level != 1.0:
+                if self.in_refine_mode:
+                    print("Reset zoom disabled in refine mode")
+                elif self.zoom_level != 1.0:
                     self.zoom_level = 1.0
                     self.zoom_center = (self.img_width / 2, self.img_height / 2)
                     print("Zoom reset to 1.0x")
@@ -361,10 +583,15 @@ def main():
     parser.add_argument("--output_dir", type=str, help="Path to the output directory")
     parser.add_argument("--refine_tennis_ball", action="store_true",
                        help="Enable automatic tennis ball detection and refinement after drawing boxes")
+    parser.add_argument("--refine_current_boxes", action="store_true",
+                       help="Refine existing annotated boxes instead of skipping annotated images. "
+                            "Loads each box sequentially in zoom/refine mode. Can be combined with "
+                            "--refine_tennis_ball for automatic refinement.")
 
     args = parser.parse_args()
 
-    annotator = BBoxAnnotator(args.image_path, args.class_id, args.output_dir, args.refine_tennis_ball)
+    annotator = BBoxAnnotator(args.image_path, args.class_id, args.output_dir,
+                              args.refine_tennis_ball, args.refine_current_boxes)
     annotator.run()
 
 

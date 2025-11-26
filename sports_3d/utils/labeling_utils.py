@@ -1,4 +1,5 @@
 from typing import Optional
+import os
 
 import cv2
 import numpy as np
@@ -20,23 +21,42 @@ def _detect_ball_hough(roi: np.ndarray, params: dict) -> Optional[tuple]:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
-    # Bilateral filter preserves ball edges while smoothing text
-    blurred = cv2.bilateralFilter(enhanced, 9, 75, 75)
 
     roi_h, roi_w = roi.shape[:2]
     min_dist = max(roi_w, roi_h) // 2
+    
+    #extract yellow and green
+    lower_green_yellow = np.array([25, 50, 50])
+    upper_green_yellow = np.array([85, 255, 255])
+    roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(roi_hsv, lower_green_yellow, upper_green_yellow)
 
-    circles = cv2.HoughCircles(
-        blurred,
+    circles_gray = cv2.HoughCircles(
+        gray,
         cv2.HOUGH_GRADIENT,
         dp=1,
         minDist=min_dist,
-        param1=50,
-        param2=25,  # Slightly higher threshold for stronger circle evidence
+        param1=20,
+        param2=15,  # Slightly higher threshold for stronger circle evidence
+        minRadius=params['minRadius'],
+        maxRadius=params['maxRadius']
+    )
+    
+    circles = cv2.HoughCircles(
+        mask,
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        minDist=min_dist,
+        param1=20,
+        param2=15,  # Slightly higher threshold for stronger circle evidence
         minRadius=params['minRadius'],
         maxRadius=params['maxRadius']
     )
 
+    if circles is not None:
+        circles = circles + circles_gray if circles_gray is not None else circles
+    else:
+        circles = circles_gray if circles_gray is not None else None
     if circles is not None and len(circles[0]) > 0:
         roi_center = (roi_w / 2, roi_h / 2)
         best_circle = None
@@ -76,6 +96,7 @@ def _detect_ball_color(roi: np.ndarray, params: dict) -> Optional[tuple]:
     # Fill holes from black text with morphological closing
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -160,7 +181,7 @@ def refined_tennis_ball_box(
     roi_h, roi_w = roi.shape[:2]
 
     min_dim = min(roi_w, roi_h)
-    min_radius = int(min_dim * 0.4)
+    min_radius = int(min_dim * 0.01)
     max_radius = int(min_dim * 1.2)
 
     params = {
@@ -208,7 +229,7 @@ def refined_tennis_ball_box(
     if refined_area > original_area * 1.05:
         return box
 
-    if refined_area < original_area * 0.3:
+    if refined_area < original_area * 0.05:
         return box
 
     return [(refined_x1, refined_y1), (refined_x2, refined_y2)]
