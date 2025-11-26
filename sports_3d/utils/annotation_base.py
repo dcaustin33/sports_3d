@@ -20,20 +20,10 @@ class BaseAnnotator:
         self.needs_redraw = True
         self.window_name = "Annotator"
 
-    def draw_text_with_outline(self, text: str, position: tuple, font_size: float = 0.5,
+    def draw_text_with_outline(self, text: str, position: tuple, font_size: float = 1.0,
                               outline_color: tuple = (0, 0, 0), text_color: tuple = (255, 255, 255),
-                              outline_thickness: int = 3, text_thickness: int = 1):
+                              outline_thickness: int = 4, text_thickness: int = 2):
         """Draw text with an outline for better visibility."""
-        cv2.putText(
-            self.display_image,
-            text,
-            position,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_size,
-            text_color,
-            text_thickness,
-            cv2.LINE_AA
-        )
         cv2.putText(
             self.display_image,
             text,
@@ -42,6 +32,16 @@ class BaseAnnotator:
             font_size,
             outline_color,
             outline_thickness,
+            cv2.LINE_AA
+        )
+        cv2.putText(
+            self.display_image,
+            text,
+            position,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_size,
+            text_color,
+            text_thickness,
             cv2.LINE_AA
         )
 

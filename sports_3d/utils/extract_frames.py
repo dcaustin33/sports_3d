@@ -1,6 +1,7 @@
-import cv2
 from pathlib import Path
 from typing import Optional
+
+import cv2
 
 
 def extract_frames(
