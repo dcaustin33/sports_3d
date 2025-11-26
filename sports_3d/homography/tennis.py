@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from PIL import Image
 import matplotlib.pyplot as plt
 
+from sports_3d.utils.labeling_utils import read_txt_file, read_yolo_box
+
 
 # origin is center of the court
 three_d_keypoints = [
@@ -23,6 +25,7 @@ three_d_keypoints = [
     (8.23 / 2, 0, -6.4),
     (0, 0, 6.4),
     (0, 0, -6.4),
+    (0, 0.914, 0)
 ]
 
 
@@ -299,6 +302,7 @@ def solve_pnp_with_focal_search(
 
     return best_f, best_pose, best_error
 
+
 def get_points(keypoints: list):
     points_2d = []
     points_3d = []
@@ -308,26 +312,32 @@ def get_points(keypoints: list):
             points_3d.append(three_d_keypoints[idx])
     return np.array(points_2d), np.array(points_3d)
 
+
 def plot_keypoints(keypoints: list, image: np.ndarray):
     for idx, keypoint in enumerate(keypoints):
         if keypoint[0] is not None and keypoint[1] is not None:
             # plot text
-            cv2.putText(image, str(idx), (int(keypoint[0]), int(keypoint[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            cv2.circle(image, (int(keypoint[0]), int(keypoint[1])), 5, (0, 0, 255), -1)
+            cv2.putText(
+                image,
+                str(idx),
+                (int(keypoint[0]), int(keypoint[1])),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                1,
+            )
+            cv2.circle(image, (int(keypoint[0]), int(keypoint[1])), 25, (0, 0, 255), -1)
     return image
+
 
 def solve_planar_pnp(object_points, image_points, camera_matrix):
     """Handles the planar ambiguity explicitly"""
-    
+
     # IPPE returns both possible solutions
     success, rvecs, tvecs, reprojErrors = cv2.solvePnPGeneric(
-        object_points,
-        image_points,
-        camera_matrix,
-        None,
-        flags=cv2.SOLVEPNP_IPPE
+        object_points, image_points, camera_matrix, None, flags=cv2.SOLVEPNP_IPPE
     )
-    
+
     # You'll get 2 solutions - pick based on physical constraints
     # e.g., camera should be in front of points, not behind
     for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
@@ -335,108 +345,154 @@ def solve_planar_pnp(object_points, image_points, camera_matrix):
         print(f"  Rotation: {rvec.ravel()}")
         print(f"  Translation: {tvec.ravel()}")
         print(f"  Reprojection error: {reprojErrors[i]}")
-    
+
     return rvecs, tvecs, reprojErrors
+
 
 def get_camera_pose_in_world(rvec, tvec):
     """Get camera position in world coordinates"""
     R, _ = cv2.Rodrigues(rvec)  # Convert axis-angle to rotation matrix
-    
+
     # Camera position in world frame
     camera_position = -R.T @ tvec
-    
+
     # Camera orientation in world frame
     R_world = R.T  # Rotation from camera to world
-    
+
     return camera_position, R_world
+
 
 def rvec_tvec_to_extrinsic(rvec, tvec):
     R, _ = cv2.Rodrigues(rvec)
     extrinsic_3x4 = np.hstack([R, tvec.reshape(3, 1)])
-    
+
     return extrinsic_3x4
+
 
 def select_valid_solution(rvecs, tvecs, reprojErrors):
     """Select the solution where camera is above the court (positive Y)"""
-    
+
     for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
         camera_pos, _ = get_camera_pose_in_world(rvec, tvec)
-        
+
         # For tennis court: camera should be above ground (Y > 0)
         # and in front of court (reasonable Z value)
         if camera_pos[2] < 0:  # camera is behind the court
             print(f"Selected solution {i}: Camera at {camera_pos.ravel()}")
             return rvec, tvec, reprojErrors[i]
-    
+
     # Fallback to lowest reprojection error
     best_idx = np.argmin(reprojErrors)
     return rvecs[best_idx], tvecs[best_idx], reprojErrors[best_idx]
 
+
+def get_2d_and_3d_keypoints(file_path: str):
+    keypoints = read_txt_file(file_path)
+    keypoints = [tuple(map(float, line.split())) for line in keypoints]
+    points_3d = []
+
+    for keypoint in keypoints:
+        points_3d.append(three_d_keypoints[int(keypoint[0])])
+    points_2d = []
+    for keypoint in keypoints:
+        points_2d.append((keypoint[1], keypoint[2]))
+    return np.array(points_2d), np.array(points_3d)
+
+
+def estimate_depth_in_camera_plane(
+    object_width_px: float, focal_px: float, object_width_m: float
+):
+    return object_width_m * focal_px / object_width_px
+
+
+def estimate_camera_plane_coordinates(
+    image_width_px: float,
+    image_height_px: float,
+    x_coord_px: float,
+    y_coord_px: float,
+    object_width_m: float,
+    object_width_px: float,
+    focal_px: float,
+) -> np.ndarray:
+    depth = estimate_depth_in_camera_plane(object_width_px, focal_px, object_width_m)
+    print(depth)
+    x_coord_m = (x_coord_px - image_width_px / 2) * depth / focal_px
+    y_coord_m = (y_coord_px - image_height_px / 2) * depth / focal_px
+    return np.array([x_coord_m, y_coord_m, depth])
+
+
+def camera_plane_to_world(
+    camera_pos: np.ndarray,
+    R_world: np.ndarray,
+    camera_plane_coordinates: np.ndarray,
+) -> np.ndarray:
+    return camera_pos + R_world @ camera_plane_coordinates
+
+
 if __name__ == "__main__":
-    device = "cpu"
-    MODEL_PATH = "/Users/derek/Desktop/sports_3d/checkpoints/model_tennis_court_det.pt"
-    model = BallTrackerNet(out_channels=15)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
-    model.eval()
-    model = model.to(device)
-
-    im_path = (
-        "/Users/derek/Desktop/sports_3d/data/Screenshot 2025-11-23 at 2.37.22 PM.png"
+    frame_name = "frame_004200_t70.000s"
+    # frame_name = "frame_004273_t71.217s"
+    keypoints_path = "/Users/derek/Desktop/sports_3d/data/sinner_ruud_keypoints/frame_004200_t70.000s_keypoints.txt"
+    image = cv2.imread(
+        f"/Users/derek/Desktop/sports_3d/data/sinner_ruud_Frames/{frame_name}.png"
     )
-
-    transform = tracknet_transform(size=(int(640), int(360)))
-    image = transform(im_path)
-    image = image.unsqueeze(0)
-    image = image.to(device)
-    preds = model(image)
-    keypoints = get_keypoints(preds[0].cpu().detach().numpy())
-    refined_keypoints = refine_keypoints(
-        keypoints, image[0].cpu().detach().numpy().transpose(1, 2, 0)
-    )
-    print(refined_keypoints)
-    refined_keypoints = [
-        refined_keypoints[0],
-        refined_keypoints[2],
-        refined_keypoints[4],
-        refined_keypoints[5],
-        refined_keypoints[10]
-    ]
-    
-    points_2d = refined_keypoints
-    points_3d = [
-        three_d_keypoints[0],
-        three_d_keypoints[2],
-        three_d_keypoints[4],
-        three_d_keypoints[5],
-        three_d_keypoints[10]
-    ]
-    points_2d = np.array(points_2d)
-    points_3d = np.array(points_3d)
-    min_f, max_f = estimate_focal_range(image.shape[2], image.shape[1])
-    
+    keypoints_2d, keypoints_3d = get_2d_and_3d_keypoints(keypoints_path)
+    plt.imshow(plot_keypoints(keypoints_2d, cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
+    min_f, max_f = estimate_focal_range(image.shape[1], image.shape[0])
     best_f, best_pose, best_error = solve_pnp_with_focal_search(
-    points_3d, points_2d, focal_range=(min_f, max_f), principal_point=(image[0].shape[2] / 2, image[0].shape[1] / 2)
+        keypoints_3d,
+        keypoints_2d,
+        focal_range=(min_f, max_f),
+        principal_point=(image.shape[1] / 2, image.shape[0] / 2),
     )
+    print(keypoints_2d)
+    print(keypoints_3d)
+    print("best_error", best_error)
+    best_f = 2500
+    plt.imshow(plot_keypoints(keypoints_2d, cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
+    plt.show()
+
     camera_matrix = np.array(
-        [[best_f, 0, image[0].shape[2] / 2], [0, best_f, image[0].shape[1] / 2], [0, 0, 1]],
+        [[best_f, 0, image.shape[1] / 2], [0, best_f, image.shape[0] / 2], [0, 0, 1]],
         dtype=np.float32,
     )
-    rvecs, tvecs, errors = solve_planar_pnp(points_3d, points_2d, camera_matrix)
+    rvecs, tvecs, errors = solve_planar_pnp(keypoints_3d, keypoints_2d, camera_matrix)
     rvec, tvec, error = select_valid_solution(rvecs, tvecs, errors)
     camera_pos, R_world = get_camera_pose_in_world(rvec, tvec)
     extrinsic_matrix = rvec_tvec_to_extrinsic(rvec, tvec)
-    
-    
-    tennis_ball_width = 0.067
-    image_width = image.shape[2]
-    image_height = image.shape[1]
-    z = (tennis_ball_width * best_f) / (image_width * 0.04 / 2)
-    cx_pixels = 0.359950 * image_width
-    cy_pixels = 0.309791 * image_height
-    x_cam = (cx_pixels - image_width / 2) / best_f
-    y_cam = (cy_pixels - image_height / 2) / best_f
-    z_cam = z
-    p_cam = np.array([x_cam, y_cam, z_cam])
-    r = extrinsic_matrix[:3, :3]
-    t = extrinsic_matrix[:3, 3]
-    print(r.T @ (p_cam - t))
+
+    yolo_box = read_yolo_box(
+        f"/Users/derek/Desktop/sports_3d/data/sinner_ruud_bbox/{frame_name}_bbox_refined.txt"
+    )
+    image_height, image_width, _ = image.shape
+    cx, cy, w, h = yolo_box[0]
+    cx = cx * image_width
+    cy = cy * image_height
+    w = w * image_width
+    h = h * image_height
+    print(w, h, image_width, image_height, best_f)
+    camera_plane_coordinates = estimate_camera_plane_coordinates(
+        image_width_px=image_width,
+        image_height_px=image_height,
+        x_coord_px=cx,
+        y_coord_px=cy,
+        object_width_m=0.066,
+        object_width_px=w+10,
+        focal_px=best_f,
+    )
+    # P_world = R_world @ camera_plane_coordinates.reshape(3, 1) - tvec
+    P_world = R_world @ camera_plane_coordinates.reshape(3, 1) + camera_pos
+    print(P_world)
+
+    print(f"Estimated focal length: {best_f:.1f} px")
+    print(f"Implied horizontal FOV: {2 * np.degrees(np.arctan(image_width / (2 * best_f))):.1f}°")
+
+    # Check bounding box dimensions
+    print(f"Bounding box: {w:.1f} x {h:.1f} px, aspect ratio: {w/h:.2f}")
+    # For a tennis ball this should be close to 1.0
+
+    # Print intermediate depth
+    print(f"Estimated depth in camera frame: {camera_plane_coordinates[2]:.2f} m")
+
+    # Verify camera position makes sense
+    print(f"Camera position (world): {camera_pos.ravel()}")
