@@ -640,6 +640,7 @@ if __name__ == "__main__":
     image_height, image_width, _ = image.shape
 
     bbox_adjusted = list(yolo_box[0])
+    print("Bbox Adjusted", bbox_adjusted)
 
     P_world = bbox_to_world_coordinates(
         bbox_yolo=tuple(bbox_adjusted),
@@ -649,6 +650,7 @@ if __name__ == "__main__":
         image_height=image_height,
         object_width_m=0.066,
     )
+    import pdb; pdb.set_trace()
 
     print("Camera Position", camera_pos)
     print("Object World Position", P_world)
