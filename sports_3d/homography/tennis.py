@@ -1,13 +1,12 @@
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-import matplotlib.pyplot as plt
 
 from sports_3d.utils.labeling_utils import read_txt_file, read_yolo_box
-
 
 # origin is center of the court
 three_d_keypoints = [
@@ -253,7 +252,7 @@ def estimate_focal_range(image_width, image_height):
     # Add 20% margin
     min_f *= 0.8
     max_f *= 1.2
-
+    
     return min_f, max_f
 
 
@@ -273,7 +272,7 @@ def solve_pnp_with_focal_search(
     best_pose = None
 
     # Try different focal lengths
-    for f in np.linspace(focal_range[0], focal_range[1], 50):
+    for f in np.linspace(focal_range[0], focal_range[1], 500):
         camera_matrix = np.array(
             [[f, 0, principal_point[0]], [0, f, principal_point[1]], [0, 0, 1]],
             dtype=np.float32,
@@ -290,6 +289,63 @@ def solve_pnp_with_focal_search(
 
         if success:
             # Compute reprojection error
+            projected, _ = cv2.projectPoints(
+                object_points, rvec, tvec, camera_matrix, None
+            )
+            error = np.mean(np.linalg.norm(projected.squeeze() - image_points, axis=1))
+
+            if error < best_error:
+                best_error = error
+                best_f = f
+                best_pose = (rvec, tvec)
+
+    return best_f, best_pose, best_error
+
+def solve_pnp_with_focal_search(
+    object_points, image_points, focal_range=(500, 2000), principal_point=None
+):
+    """
+    object_points: Nx3 array of 3D points
+    image_points: Nx2 array of 2D image points
+    focal_range: (min_f, max_f) to search
+    """
+    if principal_point is None:
+        principal_point = (image_points[:, 0].mean(), image_points[:, 1].mean())
+
+    best_f = None
+    best_error = float("inf")
+    best_pose = None
+
+    # Check if points are coplanar (all Y values the same, or all on one plane)
+    y_values = object_points[:, 1]
+    is_coplanar = np.allclose(y_values, y_values[0], atol=0.01)
+    
+    # Use IPPE for coplanar, SQPNP or ITERATIVE for non-coplanar
+    if is_coplanar:
+        solver_flag = cv2.SOLVEPNP_IPPE
+    else:
+        # SQPNP is robust and works well with 4+ points
+        solver_flag = cv2.SOLVEPNP_SQPNP
+
+    # Try different focal lengths
+    for f in np.linspace(focal_range[0], focal_range[1], 50):
+        camera_matrix = np.array(
+            [[f, 0, principal_point[0]], [0, f, principal_point[1]], [0, 0, 1]],
+            dtype=np.float32,
+        )
+
+        try:
+            success, rvec, tvec = cv2.solvePnP(
+                object_points.astype(np.float32),
+                image_points.astype(np.float32),
+                camera_matrix,
+                None,
+                flags=solver_flag,
+            )
+        except cv2.error:
+            continue
+
+        if success:
             projected, _ = cv2.projectPoints(
                 object_points, rvec, tvec, camera_matrix, None
             )
@@ -348,6 +404,45 @@ def solve_planar_pnp(object_points, image_points, camera_matrix):
 
     return rvecs, tvecs, reprojErrors
 
+def solve_pnp_generic(object_points, image_points, camera_matrix):
+    """Handles both planar and non-planar cases"""
+    
+    y_values = object_points[:, 1]
+    is_coplanar = np.allclose(y_values, y_values[0], atol=0.01)
+    
+    if is_coplanar:
+        # IPPE returns both ambiguous solutions
+        success, rvecs, tvecs, reprojErrors = cv2.solvePnPGeneric(
+            object_points.astype(np.float32), 
+            image_points.astype(np.float32), 
+            camera_matrix, 
+            None, 
+            flags=cv2.SOLVEPNP_IPPE
+        )
+    else:
+        # Non-planar: unique solution, no ambiguity!
+        success, rvec, tvec = cv2.solvePnP(
+            object_points.astype(np.float32),
+            image_points.astype(np.float32),
+            camera_matrix,
+            None,
+            flags=cv2.SOLVEPNP_SQPNP,
+        )
+        if success:
+            projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, None)
+            error = np.mean(np.linalg.norm(projected.squeeze() - image_points, axis=1))
+            rvecs, tvecs, reprojErrors = [rvec], [tvec], [error]
+        else:
+            return None, None, None
+
+    for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
+        print(f"Solution {i}:")
+        print(f"  Rotation: {rvec.ravel()}")
+        print(f"  Translation: {tvec.ravel()}")
+        print(f"  Reprojection error: {reprojErrors[i]}")
+
+    return rvecs, tvecs, reprojErrors
+
 
 def get_camera_pose_in_world(rvec, tvec):
     """Get camera position in world coordinates"""
@@ -360,6 +455,43 @@ def get_camera_pose_in_world(rvec, tvec):
     R_world = R.T  # Rotation from camera to world
 
     return camera_position, R_world
+
+
+def build_intrinsic_matrix(
+    focal_length: float,
+    principal_point: tuple[float, float] = None,
+    image_width: int = None,
+    image_height: int = None,
+) -> np.ndarray:
+    """
+    Build a 3x3 camera intrinsic matrix.
+
+    Args:
+        focal_length: Focal length in pixels (assumes fx = fy)
+        principal_point: (cx, cy) principal point in pixels.
+                        If None, uses image center (requires image_width/height)
+        image_width: Image width in pixels (required if principal_point is None)
+        image_height: Image height in pixels (required if principal_point is None)
+
+    Returns:
+        3x3 intrinsic matrix K:
+            [[f,  0, cx],
+             [0,  f, cy],
+             [0,  0,  1]]
+    """
+    if principal_point is None:
+        if image_width is None or image_height is None:
+            raise ValueError(
+                "Must provide either principal_point or image_width/image_height"
+            )
+        cx = image_width / 2
+        cy = image_height / 2
+    else:
+        cx, cy = principal_point
+
+    return np.array(
+        [[focal_length, 0, cx], [0, focal_length, cy], [0, 0, 1]], dtype=np.float32
+    )
 
 
 def rvec_tvec_to_extrinsic(rvec, tvec):
@@ -415,7 +547,6 @@ def estimate_camera_plane_coordinates(
     focal_px: float,
 ) -> np.ndarray:
     depth = estimate_depth_in_camera_plane(object_width_px, focal_px, object_width_m)
-    print(depth)
     x_coord_m = (x_coord_px - image_width_px / 2) * depth / focal_px
     y_coord_m = (y_coord_px - image_height_px / 2) * depth / focal_px
     return np.array([x_coord_m, y_coord_m, depth])
@@ -429,6 +560,55 @@ def camera_plane_to_world(
     return camera_pos + R_world @ camera_plane_coordinates
 
 
+def bbox_to_world_coordinates(
+    bbox_yolo: tuple[float, float, float, float],
+    intrinsic_matrix: np.ndarray,
+    extrinsic_matrix: np.ndarray,
+    image_width: int,
+    image_height: int,
+    object_width_m: float = 0.066,
+) -> np.ndarray:
+    """
+    Convert bounding box position to 3D world coordinates.
+
+    Args:
+        bbox_yolo: YOLO format (cx_norm, cy_norm, w_norm, h_norm)
+        intrinsic_matrix: 3x3 camera intrinsic matrix K
+        extrinsic_matrix: 3x4 camera extrinsic matrix [R | t]
+        image_width: Image width in pixels
+        image_height: Image height in pixels
+        object_width_m: Real-world object width in meters (default: 0.066 for tennis ball)
+
+    Returns:
+        3D world coordinates as np.ndarray of shape (3, 1): [X, Y, Z]
+    """
+    f = intrinsic_matrix[0, 0]
+    cx = intrinsic_matrix[0, 2]
+    cy = intrinsic_matrix[1, 2]
+
+    R = extrinsic_matrix[:, :3]
+    t = extrinsic_matrix[:, 3]
+
+    camera_pos = -R.T @ t
+    R_world = R.T
+
+    cx_px = bbox_yolo[0] * image_width
+    cy_px = bbox_yolo[1] * image_height
+    w_px = bbox_yolo[2] * image_width
+    h_px = bbox_yolo[3] * image_height
+
+    depth = object_width_m * f / w_px
+
+    x_cam = (cx_px - cx) * depth / f
+    y_cam = (cy_px - cy) * depth / f
+    z_cam = depth
+
+    P_cam = np.array([x_cam, y_cam, z_cam])
+    P_world = camera_pos + R_world @ P_cam
+
+    return P_world.reshape(3, 1)
+
+
 if __name__ == "__main__":
     frame_name = "frame_004200_t70.000s"
     # frame_name = "frame_004273_t71.217s"
@@ -437,7 +617,6 @@ if __name__ == "__main__":
         f"/Users/derek/Desktop/sports_3d/data/sinner_ruud_Frames/{frame_name}.png"
     )
     keypoints_2d, keypoints_3d = get_2d_and_3d_keypoints(keypoints_path)
-    plt.imshow(plot_keypoints(keypoints_2d, cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
     min_f, max_f = estimate_focal_range(image.shape[1], image.shape[0])
     best_f, best_pose, best_error = solve_pnp_with_focal_search(
         keypoints_3d,
@@ -445,54 +624,31 @@ if __name__ == "__main__":
         focal_range=(min_f, max_f),
         principal_point=(image.shape[1] / 2, image.shape[0] / 2),
     )
-    print(keypoints_2d)
-    print(keypoints_3d)
-    print("best_error", best_error)
-    best_f = 2500
-    plt.imshow(plot_keypoints(keypoints_2d, cv2.cvtColor(image, cv2.COLOR_BGR2RGB)))
-    plt.show()
-
-    camera_matrix = np.array(
-        [[best_f, 0, image.shape[1] / 2], [0, best_f, image.shape[0] / 2], [0, 0, 1]],
-        dtype=np.float32,
-    )
-    rvecs, tvecs, errors = solve_planar_pnp(keypoints_3d, keypoints_2d, camera_matrix)
-    rvec, tvec, error = select_valid_solution(rvecs, tvecs, errors)
+    rvec, tvec = best_pose
     camera_pos, R_world = get_camera_pose_in_world(rvec, tvec)
     extrinsic_matrix = rvec_tvec_to_extrinsic(rvec, tvec)
 
+    intrinsic_matrix = build_intrinsic_matrix(
+        focal_length=best_f,
+        image_width=image.shape[1],
+        image_height=image.shape[0]
+    )
+
     yolo_box = read_yolo_box(
-        f"/Users/derek/Desktop/sports_3d/data/sinner_ruud_bbox/{frame_name}_bbox_refined.txt"
+        f"/Users/derek/Desktop/sports_3d/data/sinner_ruud_bbox/{frame_name}_bbox.txt"
     )
     image_height, image_width, _ = image.shape
-    cx, cy, w, h = yolo_box[0]
-    cx = cx * image_width
-    cy = cy * image_height
-    w = w * image_width
-    h = h * image_height
-    print(w, h, image_width, image_height, best_f)
-    camera_plane_coordinates = estimate_camera_plane_coordinates(
-        image_width_px=image_width,
-        image_height_px=image_height,
-        x_coord_px=cx,
-        y_coord_px=cy,
+
+    bbox_adjusted = list(yolo_box[0])
+
+    P_world = bbox_to_world_coordinates(
+        bbox_yolo=tuple(bbox_adjusted),
+        intrinsic_matrix=intrinsic_matrix,
+        extrinsic_matrix=extrinsic_matrix,
+        image_width=image_width,
+        image_height=image_height,
         object_width_m=0.066,
-        object_width_px=w+10,
-        focal_px=best_f,
     )
-    # P_world = R_world @ camera_plane_coordinates.reshape(3, 1) - tvec
-    P_world = R_world @ camera_plane_coordinates.reshape(3, 1) + camera_pos
-    print(P_world)
 
-    print(f"Estimated focal length: {best_f:.1f} px")
-    print(f"Implied horizontal FOV: {2 * np.degrees(np.arctan(image_width / (2 * best_f))):.1f}°")
-
-    # Check bounding box dimensions
-    print(f"Bounding box: {w:.1f} x {h:.1f} px, aspect ratio: {w/h:.2f}")
-    # For a tennis ball this should be close to 1.0
-
-    # Print intermediate depth
-    print(f"Estimated depth in camera frame: {camera_plane_coordinates[2]:.2f} m")
-
-    # Verify camera position makes sense
-    print(f"Camera position (world): {camera_pos.ravel()}")
+    print("Camera Position", camera_pos)
+    print("Object World Position", P_world)
