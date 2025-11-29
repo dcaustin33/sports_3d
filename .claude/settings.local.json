@@ -3,7 +3,8 @@
     "allow": [
       "Bash(uv run python:*)",
       "Bash(.venv/bin/python:*)",
-      "Skill(github-code-review)"
+      "Skill(github-code-review)",
+      "Bash(xargs ls:*)"
     ],
     "deny": [],
     "ask": []
