@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(uv run python:*)",
-      "Bash(.venv/bin/python:*)"
+      "Bash(.venv/bin/python:*)",
+      "Skill(github-code-review)"
     ],
     "deny": [],
     "ask": []
