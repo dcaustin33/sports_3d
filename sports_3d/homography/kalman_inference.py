@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 from sports_3d.utils.kalman import TrajectoryFilter, reprojection_to_3d_uncertainty
 
@@ -37,12 +38,6 @@ def discover_trajectory_files(input_dir: Path) -> List[Path]:
         ValueError: If no trajectory files found or directory doesn't exist
     """
     input_dir = Path(input_dir)
-
-    if not input_dir.exists():
-        raise ValueError(f"Input directory does not exist: {input_dir}")
-
-    if not input_dir.is_dir():
-        raise ValueError(f"Input path is not a directory: {input_dir}")
 
     json_files = list(input_dir.glob("*_trajectory.json"))
 
@@ -230,21 +225,9 @@ def update_json_files(
         backup: Create backup files before overwriting
         dry_run: Preview changes without writing
     """
-    for i, (json_file, json_dict) in enumerate(zip(json_files, json_dicts)):
+    for i, (json_file, json_dict) in tqdm(enumerate(zip(json_files, json_dicts))):
         filtered_entry = create_filtered_projections_entry(i, filter_result)
         json_dict['filtered_projections'] = filtered_entry
-
-        if (i + 1) % 10 == 0:
-            print(f"  Processed {i + 1}/{len(json_files)} files...")
-
-        if dry_run:
-            if i == 0:
-                print(f"\n  Preview of first file ({json_file.name}):")
-                print(f"    Added field: filtered_projections")
-                print(f"    Position: {filtered_entry['position_filtered_m']}")
-                print(f"    Velocity: {filtered_entry['velocity_m_per_s']}")
-                print(f"    Metadata: {filtered_entry['filter_metadata']}")
-            continue
 
         if backup:
             backup_path = json_file.with_suffix('.json.bak')

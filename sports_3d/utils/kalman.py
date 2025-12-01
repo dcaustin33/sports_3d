@@ -117,6 +117,7 @@ def _detect_discontinuities(
             a_y[i] = (v_y[i + 1] - v_y[i - 1]) / dt_total
             a_z[i] = (v_z[i + 1] - v_z[i - 1]) / dt_total
 
+    import pdb; pdb.set_trace()
     is_discontinuity = (np.abs(a_z) > threshold_z) | (np.abs(a_y) > threshold_y)
     discontinuity_indices = np.where(is_discontinuity)[0]
 
