@@ -63,75 +63,36 @@ def reprojection_to_3d_uncertainty(
 
 
 def _detect_discontinuities(
-    timestamps: np.ndarray,
-    positions: np.ndarray,
-    threshold_z: float = 200.0,
-    threshold_y: float = 150.0
+    n_frames: int,
+    event_dict: Dict[int, Dict]
 ) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
     """
-    Detect velocity discontinuities (bounces, hits) via acceleration spikes.
+    Detect velocity discontinuities using event annotations.
 
-    Uses finite-difference approximation to compute velocities and accelerations
-    in Y and Z directions. Detects frames where acceleration magnitude exceeds
-    physical thresholds (much larger than gravity).
-
-    Note: Thresholds should be set high enough to avoid false positives from
-    measurement noise, which gets amplified by double differentiation.
+    Uses event frames as ground truth discontinuities to split trajectory into segments.
 
     Args:
-        timestamps: (N,) array of timestamps in seconds
-        positions: (N, 3) array of [x, y, z] positions in meters
-        threshold_z: Acceleration threshold for Z-axis in m/s² (default: 200)
-        threshold_y: Acceleration threshold for Y-axis in m/s² (default: 150)
+        n_frames: Total number of frames in trajectory
+        event_dict: Dictionary mapping frame indices to event data
 
     Returns:
         discontinuity_indices: Array of frame indices where discontinuities occur
         segments: List of (start_idx, end_idx) tuples for continuous segments
     Segments with fewer than 3 points are excluded (insufficient for filtering).
-
     """
-    n = len(timestamps)
-    if n < 3:
+    if n_frames < 3:
         return np.array([], dtype=int), []
-    if n < 5:
-        return np.array([], dtype=int), [(0, n)]
 
-    y_positions = positions[:, 1]
-    z_positions = positions[:, 2]
-
-    v_y = np.zeros(n)
-    v_z = np.zeros(n)
-    a_y = np.zeros(n)
-    a_z = np.zeros(n)
-
-    for i in range(1, n - 1):
-        dt_total = timestamps[i + 1] - timestamps[i - 1]
-
-        if dt_total > 0:
-            v_y[i] = (y_positions[i + 1] - y_positions[i - 1]) / dt_total
-            v_z[i] = (z_positions[i + 1] - z_positions[i - 1]) / dt_total
-
-    for i in range(2, n - 2):
-        dt_total = timestamps[i + 1] - timestamps[i - 1]
-        if dt_total > 0:
-            a_y[i] = (v_y[i + 1] - v_y[i - 1]) / dt_total
-            a_z[i] = (v_z[i + 1] - v_z[i - 1]) / dt_total
-
-    import pdb; pdb.set_trace()
-    is_discontinuity = (np.abs(a_z) > threshold_z) | (np.abs(a_y) > threshold_y)
-    discontinuity_indices = np.where(is_discontinuity)[0]
+    discontinuity_indices = np.array(sorted(event_dict.keys()), dtype=int)
 
     segments = []
-    if len(discontinuity_indices) == 0:
-        segments.append((0, n))
-    else:
-        start = 0
-        for disc_idx in discontinuity_indices:
-            if disc_idx > start:
-                segments.append((start, disc_idx))
-            start = disc_idx + 1
-        if start < n:
-            segments.append((start, n))
+    start = 0
+    for disc_idx in discontinuity_indices:
+        if disc_idx > start:
+            segments.append((start, disc_idx))
+        start = disc_idx + 1
+    if start < n_frames:
+        segments.append((start, n_frames))
 
     valid_segments = [(s, e) for s, e in segments if e - s >= 3]
 
@@ -346,8 +307,6 @@ class TrajectoryFilter:
         process_noise_z: float = 1.0,
         window_size_xy: int = 7,
         poly_order: int = 2,
-        accel_threshold_z: float = 200.0,
-        accel_threshold_y: float = 150.0,
         verbose: bool = False
     ):
         """
@@ -358,14 +317,10 @@ class TrajectoryFilter:
             process_noise_z: Process noise for Z-axis Kalman filter
             window_size_xy: Smoothing window size for X/Y axes
             poly_order: Polynomial order for X/Y smoothing
-            accel_threshold_z: Z-axis acceleration threshold for discontinuity detection (m/s²)
-            accel_threshold_y: Y-axis acceleration threshold for discontinuity detection (m/s²)
             verbose: Enable debug output
         """
         self.gravity = gravity
         self.process_noise_z = process_noise_z
-        self.accel_threshold_z = accel_threshold_z
-        self.accel_threshold_y = accel_threshold_y
         self.verbose = verbose
 
         self.poly_smoother = PolynomialSmoother(window_size_xy, poly_order)
@@ -459,7 +414,8 @@ class TrajectoryFilter:
         self,
         timestamps: np.ndarray,
         positions: np.ndarray,
-        uncertainties: np.ndarray
+        uncertainties: np.ndarray,
+        event_dict: Dict[int, Dict]
     ) -> Dict[str, np.ndarray]:
         """
         Filter 3D trajectory data.
@@ -468,6 +424,7 @@ class TrajectoryFilter:
             timestamps: (N,) array of timestamps in seconds
             positions: (N, 3) array of [x, y, z] positions in meters
             uncertainties: (N,) array of measurement uncertainties in meters
+            event_dict: Dictionary mapping frame indices to event data
 
         Returns:
             Dictionary with filtered results:
@@ -485,12 +442,7 @@ class TrajectoryFilter:
         if n < 3:
             raise ValueError("Need at least 3 measurements for filtering")
 
-        discontinuity_frames, segments = _detect_discontinuities(
-            timestamps,
-            positions,
-            self.accel_threshold_z,
-            self.accel_threshold_y
-        )
+        discontinuity_frames, segments = _detect_discontinuities(n, event_dict)
 
         if len(segments) == 0:
             if self.verbose:

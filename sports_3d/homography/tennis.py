@@ -560,6 +560,85 @@ def camera_plane_to_world(
     return camera_pos + R_world @ camera_plane_coordinates
 
 
+def pixel_to_court_plane_point(
+    pixel_x: float,
+    pixel_y: float,
+    intrinsic_matrix: np.ndarray,
+    extrinsic_matrix: np.ndarray
+) -> np.ndarray | None:
+    """
+    Project 2D pixel coordinate to 3D world coordinate on court plane (y=0).
+
+    Uses ray-plane intersection to find where the ray from camera through pixel
+    intersects the ground plane at y=0.
+
+    Args:
+        pixel_x: Pixel x-coordinate
+        pixel_y: Pixel y-coordinate
+        intrinsic_matrix: 3x3 camera intrinsic matrix K
+        extrinsic_matrix: 3x4 camera extrinsic matrix [R | t]
+
+    Returns:
+        3D world coordinates [x, 0, z] on court plane, or None if no valid intersection
+
+    Raises:
+        ValueError: If ray is parallel to ground plane or intersection is behind camera
+    """
+    K_inv = np.linalg.inv(intrinsic_matrix)
+    ray_cam = K_inv @ np.array([pixel_x, pixel_y, 1.0])
+    ray_cam = ray_cam / np.linalg.norm(ray_cam)
+
+    R = extrinsic_matrix[:, :3]
+    t = extrinsic_matrix[:, 3]
+    R_world = R.T
+    camera_pos = -R.T @ t
+
+    ray_world = R_world @ ray_cam
+    ray_world = ray_world / np.linalg.norm(ray_world)
+
+    if abs(ray_world[1]) < 1e-6:
+        raise ValueError(f"Ray parallel to ground plane (ray_y={ray_world[1]:.2e})")
+
+    t_intersect = -camera_pos[1] / ray_world[1]
+
+    if t_intersect < 0:
+        raise ValueError(f"Intersection behind camera (t={t_intersect:.3f})")
+
+    P_world = camera_pos + t_intersect * ray_world
+    P_world[1] = 0.0
+
+    return P_world
+
+
+def pixel_to_court_plane_depth(
+    pixel_x: float,
+    pixel_y: float,
+    intrinsic_matrix: np.ndarray,
+    extrinsic_matrix: np.ndarray
+) -> float | None:
+    """
+    Project 2D pixel to court plane and return only z-depth.
+
+    Wrapper around pixel_to_court_plane_point() that returns only the z-coordinate.
+
+    Args:
+        pixel_x: Pixel x-coordinate
+        pixel_y: Pixel y-coordinate
+        intrinsic_matrix: 3x3 camera intrinsic matrix K
+        extrinsic_matrix: 3x4 camera extrinsic matrix [R | t]
+
+    Returns:
+        Z-coordinate (depth) in world space, or None if projection fails
+
+    Raises:
+        ValueError: If ray is parallel to ground plane or intersection is behind camera
+    """
+    P_world = pixel_to_court_plane_point(pixel_x, pixel_y, intrinsic_matrix, extrinsic_matrix)
+    if P_world is None:
+        return None
+    return P_world[2]
+
+
 def bbox_to_world_coordinates(
     bbox_yolo: tuple[float, float, float, float],
     intrinsic_matrix: np.ndarray,
