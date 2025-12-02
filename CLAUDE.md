@@ -23,7 +23,7 @@ uv sync
 ```bash
 .venv/bin/python main.py
 .venv/bin/python sports_3d/homography/tennis.py
-.venv/bin/python -m sports_3d.utils.annotate_bbox image.png
+.venv/bin/python -m sports_3d.utils.annotate_bbox_tennis image.png
 .venv/bin/python -m sports_3d.utils.label_keypoints image.png
 ```
 
@@ -72,9 +72,11 @@ The `BallTrackerNet` is a fully convolutional network:
 - `data/` - Input images and videos for processing
 - `sports_3d/homography/` - Computer vision algorithms
 - `sports_3d/utils/` - Annotation and utility tools:
-  - `annotation_base.py` - Base class for annotation tools
-  - `annotate_bbox.py` - Interactive bounding box labeling tool (YOLO format)
+  - `annotation_base.py` - Base class for all annotation tools
+  - `bbox_annotator_base.py` - Reusable bounding box annotation base class
+  - `annotate_bbox_tennis.py` - Tennis ball bounding box labeling tool (YOLO format)
   - `label_keypoints.py` - Interactive keypoint labeling tool
+  - `labeling_utils.py` - Tennis ball detection utilities (Hough+color)
   - `extract_frames.py` - Video frame extraction utility
 - `main.py` - Entry point (currently just prints hello world)
 
@@ -101,13 +103,21 @@ Court keypoints (indices 0-13):
 
 ## Annotation Tools
 
-### Bounding Box Annotator
+### Tennis Ball Bounding Box Annotator
 ```bash
-.venv/bin/python -m sports_3d.utils.annotate_bbox IMAGE_PATH [--class_id 0] [--output_dir PATH]
+.venv/bin/python -m sports_3d.utils.annotate_bbox_tennis IMAGE_PATH [--class_id 0] [--output_dir PATH]
 ```
 - Drag to draw bounding boxes
 - Saves in YOLO format: `class_id cx cy w h` (normalized coordinates)
-- Keyboard: D=delete last, S=save, Q=quit
+- Keyboard: D=delete last, S=save, Q=quit, Ctrl+Click=zoom, R=reset zoom
+- Support for batch processing (pass directory instead of file)
+- Optional `--refine_tennis_ball` flag enables automatic ball detection using Hough circle + color segmentation
+- Optional `--refine_current_boxes` flag to refine existing annotations
+
+**Architecture:**
+- Extends `BaseBBoxAnnotator` (reusable base class in `bbox_annotator_base.py`)
+- Tennis-specific refinement logic in `TennisBBoxAnnotator.refine_box()` hook
+- Easy to extend for other sports (soccer, basketball) by inheriting from `BaseBBoxAnnotator`
 
 ### Keypoint Labeler
 ```bash
