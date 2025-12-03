@@ -1,12 +1,11 @@
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-from sports_3d.utils.labeling_utils import read_txt_file, read_yolo_box
+from sports_3d.utils.labeling_utils import read_txt_file
 
 # origin is center of the court
 three_d_keypoints = [
@@ -121,9 +120,9 @@ class BallTrackerNet(nn.Module):
                 nn.init.constant_(module.bias, 0)
 
 
-def postprocess(heatmap, scale=2, low_thresh=250, min_radius=10, max_radius=30):
+def postprocess(heatmap, scale=2, low_thresh=250):
     x_pred, y_pred = None, None
-    ret, heatmap = cv2.threshold(heatmap, low_thresh, 255, cv2.THRESH_BINARY)
+    _, heatmap = cv2.threshold(heatmap, low_thresh, 255, cv2.THRESH_BINARY)
     circles = cv2.HoughCircles(
         heatmap,
         cv2.HOUGH_GRADIENT,
@@ -143,7 +142,7 @@ def get_keypoints(preds: torch.Tensor):
     points = []
     for kps_num in range(14):
         heatmap = (preds[kps_num] * 255).astype(np.uint8)
-        x_pred, y_pred = postprocess(heatmap, scale=1, low_thresh=170, max_radius=25)
+        x_pred, y_pred = postprocess(heatmap, scale=1, low_thresh=170)
         points.append((x_pred, y_pred))
     return points
 
@@ -153,6 +152,7 @@ class tracknet_transform(torch.nn.Module):
         self,
         size: tuple,
     ) -> None:
+        super().__init__()
         self.img_size = size
 
     def __call__(self, img_path: str) -> torch.Tensor:
@@ -210,8 +210,9 @@ def refine_keypoints(keypoints: list, image: np.ndarray, window_size=20):
             skeleton, maxCorners=5, qualityLevel=0.01, minDistance=5, blockSize=3
         )
 
+        center_x, center_y = window.shape[1] // 2, window.shape[0] // 2
+
         if corners is not None and len(corners) > 0:
-            center_x, center_y = window.shape[1] // 2, window.shape[0] // 2
             corners = corners.reshape(-1, 2)
             closest = min(
                 corners, key=lambda p: (p[0] - center_x) ** 2 + (p[1] - center_y) ** 2
@@ -220,17 +221,14 @@ def refine_keypoints(keypoints: list, image: np.ndarray, window_size=20):
             refined_y = closest[1] + y_min
             refined_keypoints.append((refined_x, refined_y))
         else:
-            center_x, center_y = window.shape[1] // 2, window.shape[0] // 2
             y_coords, x_coords = np.where(binary > 0)
 
             if len(x_coords) > 0:
-                # Calculate weights based on distance to center
                 distances = np.sqrt(
                     (x_coords - center_x) ** 2 + (y_coords - center_y) ** 2
                 )
-                weights = np.exp(-distances / 10)  # Gaussian weighting
+                weights = np.exp(-distances / 10)
 
-                # Weighted centroid
                 centroid_x = np.average(x_coords, weights=weights)
                 centroid_y = np.average(y_coords, weights=weights)
 
@@ -252,7 +250,7 @@ def estimate_focal_range(image_width, image_height):
     # Add 20% margin
     min_f *= 0.8
     max_f *= 1.2
-    
+
     return min_f, max_f
 
 
@@ -271,63 +269,6 @@ def solve_pnp_with_focal_search(
     best_error = float("inf")
     best_pose = None
 
-    # Try different focal lengths
-    for f in np.linspace(focal_range[0], focal_range[1], 500):
-        camera_matrix = np.array(
-            [[f, 0, principal_point[0]], [0, f, principal_point[1]], [0, 0, 1]],
-            dtype=np.float32,
-        )
-
-        # Solve PnP - this returns multiple solutions for coplanar points
-        success, rvec, tvec = cv2.solvePnP(
-            object_points,
-            image_points,
-            camera_matrix,
-            None,  # no distortion
-            flags=cv2.SOLVEPNP_IPPE,  # Good for planar points
-        )
-
-        if success:
-            # Compute reprojection error
-            projected, _ = cv2.projectPoints(
-                object_points, rvec, tvec, camera_matrix, None
-            )
-            error = np.mean(np.linalg.norm(projected.squeeze() - image_points, axis=1))
-
-            if error < best_error:
-                best_error = error
-                best_f = f
-                best_pose = (rvec, tvec)
-
-    return best_f, best_pose, best_error
-
-def solve_pnp_with_focal_search(
-    object_points, image_points, focal_range=(500, 2000), principal_point=None
-):
-    """
-    object_points: Nx3 array of 3D points
-    image_points: Nx2 array of 2D image points
-    focal_range: (min_f, max_f) to search
-    """
-    if principal_point is None:
-        principal_point = (image_points[:, 0].mean(), image_points[:, 1].mean())
-
-    best_f = None
-    best_error = float("inf")
-    best_pose = None
-
-    # Check if points are coplanar (all Y values the same, or all on one plane)
-    y_values = object_points[:, 1]
-    is_coplanar = np.allclose(y_values, y_values[0], atol=0.01)
-    
-    # Use IPPE for coplanar, SQPNP or ITERATIVE for non-coplanar
-    if is_coplanar:
-        solver_flag = cv2.SOLVEPNP_IPPE
-    else:
-        # SQPNP is robust and works well with 4+ points
-        solver_flag = cv2.SOLVEPNP_SQPNP
-
-    # Try different focal lengths
     for f in np.linspace(focal_range[0], focal_range[1], 50):
         camera_matrix = np.array(
             [[f, 0, principal_point[0]], [0, f, principal_point[1]], [0, 0, 1]],
@@ -340,7 +281,7 @@ def solve_pnp_with_focal_search(
                 image_points.astype(np.float32),
                 camera_matrix,
                 None,
-                flags=solver_flag,
+                flags=cv2.SOLVEPNP_SQPNP,
             )
         except cv2.error:
             continue
@@ -386,75 +327,21 @@ def plot_keypoints(keypoints: list, image: np.ndarray):
     return image
 
 
-def solve_planar_pnp(object_points, image_points, camera_matrix):
-    """Handles the planar ambiguity explicitly"""
-
-    # IPPE returns both possible solutions
-    success, rvecs, tvecs, reprojErrors = cv2.solvePnPGeneric(
-        object_points, image_points, camera_matrix, None, flags=cv2.SOLVEPNP_IPPE
-    )
-
-    # You'll get 2 solutions - pick based on physical constraints
-    # e.g., camera should be in front of points, not behind
-    for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
-        print(f"Solution {i}:")
-        print(f"  Rotation: {rvec.ravel()}")
-        print(f"  Translation: {tvec.ravel()}")
-        print(f"  Reprojection error: {reprojErrors[i]}")
-
-    return rvecs, tvecs, reprojErrors
-
-def solve_pnp_generic(object_points, image_points, camera_matrix):
-    """Handles both planar and non-planar cases"""
-    
-    y_values = object_points[:, 1]
-    is_coplanar = np.allclose(y_values, y_values[0], atol=0.01)
-    
-    if is_coplanar:
-        # IPPE returns both ambiguous solutions
-        success, rvecs, tvecs, reprojErrors = cv2.solvePnPGeneric(
-            object_points.astype(np.float32), 
-            image_points.astype(np.float32), 
-            camera_matrix, 
-            None, 
-            flags=cv2.SOLVEPNP_IPPE
-        )
-    else:
-        # Non-planar: unique solution, no ambiguity!
-        success, rvec, tvec = cv2.solvePnP(
-            object_points.astype(np.float32),
-            image_points.astype(np.float32),
-            camera_matrix,
-            None,
-            flags=cv2.SOLVEPNP_SQPNP,
-        )
-        if success:
-            projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, None)
-            error = np.mean(np.linalg.norm(projected.squeeze() - image_points, axis=1))
-            rvecs, tvecs, reprojErrors = [rvec], [tvec], [error]
-        else:
-            return None, None, None
-
-    for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
-        print(f"Solution {i}:")
-        print(f"  Rotation: {rvec.ravel()}")
-        print(f"  Translation: {tvec.ravel()}")
-        print(f"  Reprojection error: {reprojErrors[i]}")
-
-    return rvecs, tvecs, reprojErrors
-
-
 def get_camera_pose_in_world(rvec, tvec):
     """Get camera position in world coordinates"""
-    R, _ = cv2.Rodrigues(rvec)  # Convert axis-angle to rotation matrix
-
-    # Camera position in world frame
+    R, _ = cv2.Rodrigues(rvec)
     camera_position = -R.T @ tvec
-
-    # Camera orientation in world frame
-    R_world = R.T  # Rotation from camera to world
-
+    R_world = R.T
     return camera_position, R_world
+
+
+def extract_camera_transform(extrinsic_matrix):
+    """Extract camera position and rotation from extrinsic matrix"""
+    R = extrinsic_matrix[:, :3]
+    t = extrinsic_matrix[:, 3]
+    camera_pos = -R.T @ t
+    R_world = R.T
+    return camera_pos, R_world
 
 
 def build_intrinsic_matrix(
@@ -499,23 +386,6 @@ def rvec_tvec_to_extrinsic(rvec, tvec):
     extrinsic_3x4 = np.hstack([R, tvec.reshape(3, 1)])
 
     return extrinsic_3x4
-
-
-def select_valid_solution(rvecs, tvecs, reprojErrors):
-    """Select the solution where camera is above the court (positive Y)"""
-
-    for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
-        camera_pos, _ = get_camera_pose_in_world(rvec, tvec)
-
-        # For tennis court: camera should be above ground (Y > 0)
-        # and in front of court (reasonable Z value)
-        if camera_pos[2] < 0:  # camera is behind the court
-            print(f"Selected solution {i}: Camera at {camera_pos.ravel()}")
-            return rvec, tvec, reprojErrors[i]
-
-    # Fallback to lowest reprojection error
-    best_idx = np.argmin(reprojErrors)
-    return rvecs[best_idx], tvecs[best_idx], reprojErrors[best_idx]
 
 
 def get_2d_and_3d_keypoints(file_path: str):
@@ -593,10 +463,7 @@ def pixel_to_court_plane_point(
     ray_cam = K_inv @ np.array([pixel_x, pixel_y, 1.0])
     ray_cam = ray_cam / np.linalg.norm(ray_cam)
 
-    R = extrinsic_matrix[:, :3]
-    t = extrinsic_matrix[:, 3]
-    R_world = R.T
-    camera_pos = -R.T @ t
+    camera_pos, R_world = extract_camera_transform(extrinsic_matrix)
 
     ray_world = R_world @ ray_cam
     ray_world = ray_world / np.linalg.norm(ray_world)
@@ -670,16 +537,11 @@ def bbox_to_world_coordinates(
     cx = intrinsic_matrix[0, 2]
     cy = intrinsic_matrix[1, 2]
 
-    R = extrinsic_matrix[:, :3]
-    t = extrinsic_matrix[:, 3]
-
-    camera_pos = -R.T @ t
-    R_world = R.T
+    camera_pos, R_world = extract_camera_transform(extrinsic_matrix)
 
     cx_px = bbox_yolo[0] * image_width
     cy_px = bbox_yolo[1] * image_height
     w_px = bbox_yolo[2] * image_width
-    h_px = bbox_yolo[3] * image_height
 
     depth = object_width_m * f / w_px
 
@@ -691,50 +553,3 @@ def bbox_to_world_coordinates(
     P_world = camera_pos + R_world @ P_cam
 
     return P_world.reshape(3, 1)
-
-
-if __name__ == "__main__":
-    frame_name = "frame_004200_t70.000s"
-    # frame_name = "frame_004273_t71.217s"
-    keypoints_path = "/Users/derek/Desktop/sports_3d/data/sinner_ruud_keypoints/frame_004200_t70.000s_keypoints.txt"
-    image = cv2.imread(
-        f"/Users/derek/Desktop/sports_3d/data/sinner_ruud_Frames/{frame_name}.png"
-    )
-    _, keypoints_2d, keypoints_3d = get_2d_and_3d_keypoints(keypoints_path)
-    min_f, max_f = estimate_focal_range(image.shape[1], image.shape[0])
-    best_f, best_pose, best_error = solve_pnp_with_focal_search(
-        keypoints_3d,
-        keypoints_2d,
-        focal_range=(min_f, max_f),
-        principal_point=(image.shape[1] / 2, image.shape[0] / 2),
-    )
-    rvec, tvec = best_pose
-    camera_pos, R_world = get_camera_pose_in_world(rvec, tvec)
-    extrinsic_matrix = rvec_tvec_to_extrinsic(rvec, tvec)
-
-    intrinsic_matrix = build_intrinsic_matrix(
-        focal_length=best_f,
-        image_width=image.shape[1],
-        image_height=image.shape[0]
-    )
-
-    yolo_box = read_yolo_box(
-        f"/Users/derek/Desktop/sports_3d/data/sinner_ruud_bbox/{frame_name}_bbox.txt"
-    )
-    image_height, image_width, _ = image.shape
-
-    bbox_adjusted = list(yolo_box[0])
-    print("Bbox Adjusted", bbox_adjusted)
-
-    P_world = bbox_to_world_coordinates(
-        bbox_yolo=tuple(bbox_adjusted),
-        intrinsic_matrix=intrinsic_matrix,
-        extrinsic_matrix=extrinsic_matrix,
-        image_width=image_width,
-        image_height=image_height,
-        object_width_m=0.066,
-    )
-    import pdb; pdb.set_trace()
-
-    print("Camera Position", camera_pos)
-    print("Object World Position", P_world)
