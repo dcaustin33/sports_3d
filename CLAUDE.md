@@ -70,7 +70,10 @@ The `BallTrackerNet` is a fully convolutional network:
 
 - `checkpoints/model_tennis_court_det.pt` - Pre-trained model weights (42MB PyTorch checkpoint)
 - `data/` - Input images and videos for processing
-- `sports_3d/homography/` - Computer vision algorithms
+- `sports_3d/homography/` - Computer vision algorithms:
+  - `tennis.py` - Core CV pipeline (keypoint detection, camera calibration)
+  - `tennis_trajectory.py` - Batch conversion of bounding boxes to 3D trajectories
+  - `kalman_inference.py` - Trajectory filtering with physics-aware smoothing
 - `sports_3d/utils/` - Annotation and utility tools:
   - `annotation_base.py` - Base class for all annotation tools
   - `bbox_annotator_base.py` - Reusable bounding box annotation base class
@@ -78,6 +81,8 @@ The `BallTrackerNet` is a fully convolutional network:
   - `label_keypoints.py` - Interactive keypoint labeling tool
   - `labeling_utils.py` - Tennis ball detection utilities (Hough+color)
   - `extract_frames.py` - Video frame extraction utility
+  - `file_utils.py` - Shared utilities for file discovery and JSON serialization
+  - `kalman.py` - Trajectory filtering implementation
 - `main.py` - Entry point (currently just prints hello world)
 
 ## Dependencies
@@ -132,12 +137,70 @@ Both tools:
 - Event-driven rendering for responsive performance
 - Share common base class in `annotation_base.py`
 
+## Trajectory Processing Pipeline
+
+### 1. Bounding Box to 3D Trajectory Conversion
+```bash
+.venv/bin/python -m sports_3d.homography.tennis_trajectory \
+    <bbox_dir> <keypoints_dir> <frames_dir> <output_dir> \
+    [--ball_diameter 0.066] [--verbose]
+```
+Converts tennis ball bounding boxes to 3D world coordinates:
+- Reads YOLO format bounding boxes and court keypoint annotations
+- Performs camera calibration for each frame (with focal length search)
+- Interpolates keypoints between frames when not available
+- Projects 2D bounding boxes to 3D world coordinates using calibrated camera
+- Outputs trajectory JSON files with camera calibration and 3D positions
+
+**Key features:**
+- `KeypointInterpolator`: Linearly interpolates 2D keypoints across frames
+- `compute_frame_calibration()`: Per-frame camera calibration with PnP solver
+- Eliminates duplicate image loading for performance
+- Uses shared utilities from `file_utils.py` for file discovery
+
+### 2. Trajectory Filtering and Smoothing
+```bash
+.venv/bin/python -m sports_3d.homography.kalman_inference \
+    <trajectory_dir> <events_dir> \
+    [--window_size_xy 7] [--poly_order 2] [--verbose] [--backup]
+```
+Applies physics-aware filtering to trajectory JSON files:
+- Z-axis: Quadratic fitting with velocity decay constraint
+- X/Y-axes: Savitzky-Golay polynomial smoothing
+- Automatic discontinuity detection (bounces, racquet hits)
+- Event-based refinement using ground/racquet contact annotations
+- Adds `filtered_projections` to existing JSON files
+
+**Key features:**
+- Uses shared `discover_files_by_pattern()` for consistent file discovery
+- `refine_position_hybrid()`: Improves positions using event annotations
+- `serialize_vector_3d()`: Standardized JSON serialization for 3D vectors
+- Supports backup files with `--backup` flag
+
+## Shared Utilities
+
+### `sports_3d/utils/file_utils.py`
+Common utilities for file operations and data serialization across the codebase:
+
+**Functions:**
+- `parse_frame_identifier(filename)`: Extracts base name, frame number, and timestamp from filenames
+- `discover_files_by_pattern(directory, glob_pattern, file_type_label)`: Generic file discovery with frame number sorting
+- `serialize_vector_3d(vec, prefix, unit)`: Serializes 3D vectors to both dict and array JSON formats
+
+**Constants:**
+- `FRAME_BASE_PATTERN`: Regex for matching frame identifiers (`frame_\d+_t[\d.]+s`)
+- `FRAME_NUMBER_PATTERN`: Regex for extracting frame numbers
+- `TIMESTAMP_PATTERN`: Regex for extracting timestamps
+
+**Usage:** Import and use these utilities when adding new file processing scripts to maintain consistency across the codebase.
+
 ## Coding Style Preferences
 
 - Write clear, concise code without unnecessary comments
 - Avoid adding tests unless explicitly requested
 - Prioritize code readability through self-documenting function/variable names over extensive documentation
 - Keep implementations simple and focused
+- Use shared utilities from `file_utils.py` for file discovery and JSON serialization to avoid code duplication
 
 ## Important Notes
 
