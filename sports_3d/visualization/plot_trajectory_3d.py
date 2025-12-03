@@ -49,11 +49,13 @@ def load_trajectory_data(trajectory_dir: Path) -> Tuple[List[dict], np.ndarray]:
             continue
 
         positions.append([pos["x"], pos["y"], pos["z"]])
-        metadata_list.append({
-            "frame_number": frame_num,
-            "timestamp": timestamp,
-            "file_path": str(file_path),
-        })
+        metadata_list.append(
+            {
+                "frame_number": frame_num,
+                "timestamp": timestamp,
+                "file_path": str(file_path),
+            }
+        )
 
     return metadata_list, np.array(positions)
 
@@ -92,49 +94,58 @@ def create_trajectory_figure(
         if len(tail_positions) > 0:
             # Opacity gradient from 0.2 to 0.8
             opacities = np.linspace(0.2, 0.8, len(tail_positions))
-            sizes = np.linspace(4, 8, len(tail_positions))
+            sizes = np.linspace(2, 4, len(tail_positions))
 
-            frame_data.append(go.Scatter3d(
-                x=tail_positions[:, 0],
-                y=tail_positions[:, 1],
-                z=tail_positions[:, 2],
-                mode='markers+lines',
-                marker=dict(
-                    size=sizes,
-                    color='yellow',
-                    opacity=0.6,
-                ),
-                line=dict(color='yellow', width=2),
-                showlegend=False,
-                hoverinfo='skip',
-            ))
+            frame_data.append(
+                go.Scatter3d(
+                    x=tail_positions[:, 0],
+                    y=tail_positions[:, 1],
+                    z=tail_positions[:, 2],
+                    mode="markers+lines",
+                    marker=dict(
+                        size=sizes,
+                        color="yellow",
+                        opacity=0.6,
+                    ),
+                    line=dict(color="yellow", width=2),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
 
         # Current ball position
-        frame_data.append(go.Scatter3d(
-            x=[positions[i, 0]],
-            y=[positions[i, 1]],
-            z=[positions[i, 2]],
-            mode='markers',
-            marker=dict(size=12, color='yellow'),
-            name=f"Frame {metadata[i]['frame_number']}",
-            showlegend=False,
-            hovertemplate=(
-                f"Frame: {metadata[i]['frame_number']}<br>"
-                f"Time: {metadata[i]['timestamp']:.3f}s<br>"
-                f"X: %{{x:.2f}}m<br>"
-                f"Y: %{{y:.2f}}m<br>"
-                f"Z: %{{z:.2f}}m"
-                "<extra></extra>"
-            ),
-        ))
+        frame_data.append(
+            go.Scatter3d(
+                x=[positions[i, 0]],
+                y=[positions[i, 1]],
+                z=[positions[i, 2]],
+                mode="markers",
+                marker=dict(size=6, color="yellow"),
+                name=f"Frame {metadata[i]['frame_number']}",
+                showlegend=False,
+                hovertemplate=(
+                    f"Frame: {metadata[i]['frame_number']}<br>"
+                    f"Time: {metadata[i]['timestamp']:.3f}s<br>"
+                    f"X: %{{x:.2f}}m<br>"
+                    f"Y: %{{y:.2f}}m<br>"
+                    f"Z: %{{z:.2f}}m"
+                    "<extra></extra>"
+                ),
+            )
+        )
 
         frames.append(go.Frame(data=frame_data, name=str(i)))
 
-        slider_steps.append({
-            "args": [[str(i)], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
-            "label": str(metadata[i]['frame_number']),
-            "method": "animate",
-        })
+        slider_steps.append(
+            {
+                "args": [
+                    [str(i)],
+                    {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"},
+                ],
+                "label": str(metadata[i]["frame_number"]),
+                "method": "animate",
+            }
+        )
 
     fig.frames = frames
 
@@ -145,23 +156,32 @@ def create_trajectory_figure(
 
     # Add slider
     fig.update_layout(
-        sliders=[{
-            "active": 0,
-            "yanchor": "top",
-            "xanchor": "left",
-            "currentvalue": {
-                "font": {"size": 16},
-                "prefix": "Frame: ",
-                "visible": True,
-                "xanchor": "right",
-            },
-            "steps": slider_steps,
-            "x": 0.1,
-            "len": 0.8,
-            "y": 0,
-            "pad": {"b": 10, "t": 50},
-        }],
+        sliders=[
+            {
+                "active": 0,
+                "yanchor": "top",
+                "xanchor": "left",
+                "currentvalue": {
+                    "font": {"size": 16},
+                    "prefix": "Frame: ",
+                    "visible": True,
+                    "xanchor": "right",
+                },
+                "steps": slider_steps,
+                "x": 0.1,
+                "len": 0.8,
+                "y": 0,
+                "pad": {"b": 10, "t": 50},
+            }
+        ],
         title=f"Ball Trajectory ({n_frames} frames)",
+        scene=dict(
+            camera=dict(
+                eye=dict(x=-0.8, y=0.1, z=-1.8),
+                center=dict(x=0, y=0.5, z=0),
+                up=dict(x=0, y=1, z=0),
+            )
+        ),
     )
 
     return fig
@@ -171,11 +191,30 @@ def main():
     parser = argparse.ArgumentParser(
         description="Interactive 3D trajectory visualization"
     )
-    parser.add_argument("trajectory_dir", type=Path, help="Directory with trajectory JSONs")
-    parser.add_argument("--tail_length", type=int, default=10, help="Number of trailing positions")
-    parser.add_argument("--output", type=Path, default=None, help="Output HTML file path")
-    parser.add_argument("--show", action="store_true", help="Open in browser immediately")
-    parser.add_argument("--flip_y", action="store_true", help="Flip Y axis (negate Y values)")
+    parser.add_argument(
+        "trajectory_dir", type=Path, help="Directory with trajectory JSONs"
+    )
+    parser.add_argument(
+        "--tail_length", type=int, default=10, help="Number of trailing positions"
+    )
+    parser.add_argument(
+        "--output", type=Path, default=None, help="Output HTML file path"
+    )
+    parser.add_argument(
+        "--show", action="store_true", help="Open in browser immediately"
+    )
+    parser.add_argument(
+        "--flip_y", action="store_true", help="Flip Y axis (negate Y values)"
+    )
+    parser.add_argument(
+        "--flip_x", action="store_true", help="Flip X axis (negate X values)"
+    )
+    parser.add_argument(
+        "--y_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for Y axis (e.g., 2.0 to double height)",
+    )
 
     args = parser.parse_args()
 
@@ -186,6 +225,14 @@ def main():
     if args.flip_y:
         positions[:, 1] = -positions[:, 1]
         print("Flipped Y axis")
+
+    if args.flip_x:
+        positions[:, 0] = -positions[:, 0]
+        print("Flipped X axis")
+
+    if args.y_scale != 1.0:
+        positions[:, 1] = positions[:, 1] * args.y_scale
+        print(f"Scaled Y axis by {args.y_scale}x")
 
     print("Creating visualization...")
     fig = create_trajectory_figure(positions, metadata, args.tail_length)

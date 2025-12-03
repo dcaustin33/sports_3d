@@ -351,7 +351,7 @@ class TennisCourt3D:
                 ),
                 yaxis=dict(
                     title="Y (height) [m]",
-                    range=[-1, 10],
+                    range=[-1, 3],
                     showgrid=True,
                     gridcolor='lightgray',
                 ),
