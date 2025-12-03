@@ -14,7 +14,6 @@ Usage:
 
 import argparse
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -32,6 +31,7 @@ from sports_3d.homography.tennis import (
     solve_pnp_with_focal_search,
 )
 from sports_3d.utils.labeling_utils import read_yolo_box
+from sports_3d.utils.file_utils import parse_frame_identifier, serialize_vector_3d
 
 
 @dataclass
@@ -70,9 +70,8 @@ def extract_frame_base_name(filename: str) -> Optional[str]:
     Returns:
         Base name like 'frame_004200_t70.000s' or None if not found
     """
-    pattern = r'(frame_\d+_t[\d.]+s)'
-    match = re.search(pattern, filename)
-    return match.group(1) if match else None
+    parsed = parse_frame_identifier(filename)
+    return parsed[0] if parsed else None
 
 
 def discover_frames(bbox_dir: Path, keypoints_dir: Path, frames_dir: Path) -> List[FrameMetadata]:
@@ -114,14 +113,11 @@ def discover_frames(bbox_dir: Path, keypoints_dir: Path, frames_dir: Path) -> Li
         if not frame_path.exists():
             raise FileNotFoundError(f"Frame image not found: {frame_path}")
 
-        frame_num_match = re.search(r'frame_(\d+)', base_name)
-        timestamp_match = re.search(r't([\d.]+)s', base_name)
-
-        if not frame_num_match or not timestamp_match:
+        parsed = parse_frame_identifier(base_name)
+        if not parsed:
             continue
 
-        frame_num = int(frame_num_match.group(1))
-        timestamp = float(timestamp_match.group(1))
+        _, frame_num, timestamp = parsed
 
         frames.append(FrameMetadata(
             frame_base_name=base_name,
@@ -179,18 +175,24 @@ class KeypointInterpolator:
         if self.verbose:
             print(f"KeypointInterpolator initialized with {len(self.keypoint_cache)} keypoint frames")
 
-    def _find_previous_keypoint_frame(self, frame_idx: int) -> Optional[int]:
-        """Find nearest previous frame with keypoints."""
-        for i in range(frame_idx - 1, -1, -1):
-            if i in self.keypoint_cache:
-                return i
-        return None
+    def _find_nearest_keypoint_frame(self, frame_idx: int, direction: str) -> Optional[int]:
+        """Find nearest frame with keypoints in specified direction.
 
-    def _find_next_keypoint_frame(self, frame_idx: int) -> Optional[int]:
-        """Find nearest next frame with keypoints."""
-        for i in range(frame_idx + 1, len(self.frames)):
-            if i in self.keypoint_cache:
-                return i
+        Args:
+            frame_idx: Current frame index
+            direction: 'prev' or 'next'
+
+        Returns:
+            Frame index with keypoints, or None if not found
+        """
+        if direction == 'prev':
+            for i in range(frame_idx - 1, -1, -1):
+                if i in self.keypoint_cache:
+                    return i
+        elif direction == 'next':
+            for i in range(frame_idx + 1, len(self.frames)):
+                if i in self.keypoint_cache:
+                    return i
         return None
 
     def _interpolate_keypoints(self, target_idx: int, prev_idx: int, next_idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
@@ -261,8 +263,8 @@ class KeypointInterpolator:
             indices, kp_2d, kp_3d = self.keypoint_cache[frame_idx]
             return kp_2d, kp_3d, "direct"
 
-        prev_idx = self._find_previous_keypoint_frame(frame_idx)
-        next_idx = self._find_next_keypoint_frame(frame_idx)
+        prev_idx = self._find_nearest_keypoint_frame(frame_idx, 'prev')
+        next_idx = self._find_nearest_keypoint_frame(frame_idx, 'next')
 
         if prev_idx is None and next_idx is None:
             raise ValueError(f"No keypoints available for frame {frame_idx}")
@@ -283,80 +285,72 @@ class KeypointInterpolator:
         return kp_2d, kp_3d, source
 
 
-class CalibrationManager:
-    """Computes camera calibration for each frame."""
+def compute_frame_calibration(
+    frame: FrameMetadata,
+    frame_idx: int,
+    interpolator: KeypointInterpolator,
+    img_width: int,
+    img_height: int,
+    verbose: bool = False
+) -> CameraCalibration:
+    """Compute complete camera calibration for a frame.
 
-    def __init__(self, interpolator: KeypointInterpolator, verbose: bool = False):
-        """Initialize calibration manager.
+    Args:
+        frame: Frame metadata
+        frame_idx: Frame index in the sequence
+        interpolator: Keypoint interpolator instance
+        img_width: Image width in pixels
+        img_height: Image height in pixels
+        verbose: Enable detailed logging
 
-        Args:
-            interpolator: Keypoint interpolator instance
-            verbose: Enable detailed logging
-        """
-        self.interpolator = interpolator
-        self.verbose = verbose
+    Returns:
+        Complete camera calibration data
+    """
+    keypoints_2d, keypoints_3d, keypoint_source = interpolator.get_keypoints_for_frame(frame_idx)
 
-    def get_calibration_for_frame(self, frame: FrameMetadata, frame_idx: int) -> CameraCalibration:
-        """Compute complete camera calibration for a frame.
+    min_f, max_f = estimate_focal_range(img_width, img_height)
 
-        Args:
-            frame: Frame metadata
-            frame_idx: Frame index in the sequence
+    if verbose:
+        print(f"Calibrating frame {frame.frame_number} " +
+              f"(keypoints: {keypoint_source}, focal range: {min_f:.1f}-{max_f:.1f})")
 
-        Returns:
-            Complete camera calibration data
-        """
-        keypoints_2d, keypoints_3d, keypoint_source = self.interpolator.get_keypoints_for_frame(frame_idx)
+    best_f, best_pose, best_error = solve_pnp_with_focal_search(
+        keypoints_3d,
+        keypoints_2d,
+        focal_range=(min_f, max_f),
+        principal_point=(img_width / 2, img_height / 2)
+    )
 
-        image = cv2.imread(str(frame.frame_path))
-        if image is None:
-            raise FileNotFoundError(f"Could not load image: {frame.frame_path}")
+    if best_pose is None:
+        raise RuntimeError(f"Camera calibration failed for frame {frame.frame_number}")
 
-        img_height, img_width = image.shape[:2]
+    rvec, tvec = best_pose
 
-        min_f, max_f = estimate_focal_range(img_width, img_height)
+    intrinsic_matrix = build_intrinsic_matrix(
+        focal_length=best_f,
+        image_width=img_width,
+        image_height=img_height
+    )
 
-        if self.verbose:
-            print(f"Calibrating frame {frame.frame_number} " +
-                  f"(keypoints: {keypoint_source}, focal range: {min_f:.1f}-{max_f:.1f})")
+    extrinsic_matrix = rvec_tvec_to_extrinsic(rvec, tvec)
+    camera_position, _ = get_camera_pose_in_world(rvec, tvec)
 
-        best_f, best_pose, best_error = solve_pnp_with_focal_search(
-            keypoints_3d,
-            keypoints_2d,
-            focal_range=(min_f, max_f),
-            principal_point=(img_width / 2, img_height / 2)
-        )
+    if verbose:
+        print(f"  Focal length: {best_f:.2f}px, Reprojection error: {best_error:.2f}px")
 
-        if best_pose is None:
-            raise RuntimeError(f"Camera calibration failed for frame {frame.frame_number}")
-
-        rvec, tvec = best_pose
-
-        intrinsic_matrix = build_intrinsic_matrix(
-            focal_length=best_f,
-            image_width=img_width,
-            image_height=img_height
-        )
-
-        extrinsic_matrix = rvec_tvec_to_extrinsic(rvec, tvec)
-        camera_position, _ = get_camera_pose_in_world(rvec, tvec)
-
-        if self.verbose:
-            print(f"  Focal length: {best_f:.2f}px, Reprojection error: {best_error:.2f}px")
-
-        return CameraCalibration(
-            frame_base_name=frame.frame_base_name,
-            keypoints_2d=keypoints_2d,
-            keypoints_3d=keypoints_3d,
-            focal_length=best_f,
-            rvec=rvec,
-            tvec=tvec,
-            reprojection_error=best_error,
-            intrinsic_matrix=intrinsic_matrix,
-            extrinsic_matrix=extrinsic_matrix,
-            camera_position=camera_position,
-            keypoint_source=keypoint_source
-        )
+    return CameraCalibration(
+        frame_base_name=frame.frame_base_name,
+        keypoints_2d=keypoints_2d,
+        keypoints_3d=keypoints_3d,
+        focal_length=best_f,
+        rvec=rvec,
+        tvec=tvec,
+        reprojection_error=best_error,
+        intrinsic_matrix=intrinsic_matrix,
+        extrinsic_matrix=extrinsic_matrix,
+        camera_position=camera_position,
+        keypoint_source=keypoint_source
+    )
 
 
 def create_trajectory_json(
@@ -388,6 +382,8 @@ def create_trajectory_json(
     h_px = bbox_yolo[3] * img_height
 
     distance = np.linalg.norm(world_position - calibration.camera_position)
+
+    position_data = serialize_vector_3d(world_position, "position_world", "m")
 
     return {
         "metadata": {
@@ -423,12 +419,7 @@ def create_trajectory_json(
             "ball_diameter_m": ball_diameter
         },
         "trajectory_3d": {
-            "position_world_m": {
-                "x": float(world_position[0]),
-                "y": float(world_position[1]),
-                "z": float(world_position[2])
-            },
-            "position_world_array_m": world_position.flatten().tolist(),
+            **position_data,
             "distance_from_camera_m": float(distance)
         }
     }
@@ -464,8 +455,6 @@ def process_trajectory(
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
-    calib_manager = CalibrationManager(interpolator, verbose=verbose)
-
     print(f"\nProcessing frames...")
     for i, frame in enumerate(frames):
         if verbose or (i % 10 == 0):
@@ -473,16 +462,22 @@ def process_trajectory(
 
         bbox_yolo = read_yolo_box(str(frame.bbox_path))[0]
 
-        calibration = calib_manager.get_calibration_for_frame(frame, i)
-
         image = cv2.imread(str(frame.frame_path))
+        if image is None:
+            raise FileNotFoundError(f"Could not load image: {frame.frame_path}")
+
+        img_height, img_width = image.shape[:2]
+
+        calibration = compute_frame_calibration(
+            frame, i, interpolator, img_width, img_height, verbose
+        )
 
         world_position = bbox_to_world_coordinates(
             bbox_yolo=tuple(bbox_yolo),
             intrinsic_matrix=calibration.intrinsic_matrix,
             extrinsic_matrix=calibration.extrinsic_matrix,
-            image_width=image.shape[1],
-            image_height=image.shape[0],
+            image_width=img_width,
+            image_height=img_height,
             object_width_m=ball_diameter
         )
 

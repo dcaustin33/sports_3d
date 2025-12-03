@@ -4,7 +4,8 @@
       "Bash(uv run python:*)",
       "Bash(.venv/bin/python:*)",
       "Skill(github-code-review)",
-      "Bash(xargs ls:*)"
+      "Bash(xargs ls:*)",
+      "Skill(code-refactor)"
     ],
     "deny": [],
     "ask": []
