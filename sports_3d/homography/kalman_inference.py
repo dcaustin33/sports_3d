@@ -15,7 +15,6 @@ Usage:
 
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -29,6 +28,11 @@ from sports_3d.homography.tennis import (
     rvec_tvec_to_extrinsic,
 )
 from sports_3d.utils.kalman import TrajectoryFilter, reprojection_to_3d_uncertainty
+from sports_3d.utils.file_utils import (
+    discover_files_by_pattern,
+    parse_frame_identifier,
+    serialize_vector_3d,
+)
 
 
 def discover_event_files(events_dir: Path) -> List[Path]:
@@ -44,31 +48,11 @@ def discover_event_files(events_dir: Path) -> List[Path]:
     Raises:
         ValueError: If no event files found or directory doesn't exist
     """
-    events_dir = Path(events_dir)
-
-    if not events_dir.exists():
-        raise ValueError(f"Events directory does not exist: {events_dir}")
-
-    txt_files = list(events_dir.glob("*_events.txt"))
-
-    if not txt_files:
-        raise ValueError(f"No event files (*_events.txt) found in {events_dir}")
-
-    frame_pattern = re.compile(r'frame_(\d+)_t[\d.]+s_events\.txt')
-
-    files_with_numbers = []
-    for txt_file in txt_files:
-        match = frame_pattern.search(txt_file.name)
-        if match:
-            frame_num = int(match.group(1))
-            files_with_numbers.append((frame_num, txt_file))
-        else:
-            print(f"Warning: Skipping file with unexpected name: {txt_file.name}")
-
-    files_with_numbers.sort(key=lambda x: x[0])
-    sorted_files = [f[1] for f in files_with_numbers]
-
-    return sorted_files
+    return discover_files_by_pattern(
+        events_dir,
+        "*_events.txt",
+        "Event annotation"
+    )
 
 
 def parse_event_file(event_path: Path) -> Dict | None:
@@ -138,22 +122,20 @@ def load_events(events_dir: Path, json_files: List[Path]) -> Dict[int, Dict]:
     """
     event_files = discover_event_files(events_dir)
 
-    frame_pattern = re.compile(r'frame_(\d+)_t[\d.]+s')
     trajectory_frame_numbers = {}
     for idx, json_file in enumerate(json_files):
-        match = frame_pattern.search(json_file.name)
-        if match:
-            frame_num = int(match.group(1))
+        parsed = parse_frame_identifier(json_file.name)
+        if parsed:
+            _, frame_num, _ = parsed
             trajectory_frame_numbers[frame_num] = idx
 
     events = {}
     for event_file in event_files:
-        match = frame_pattern.search(event_file.name)
-        if not match:
+        parsed = parse_frame_identifier(event_file.name)
+        if not parsed:
             continue
 
-        frame_num = int(match.group(1))
-        
+        _, frame_num, _ = parsed
 
         if frame_num not in trajectory_frame_numbers:
             raise ValueError(
@@ -193,8 +175,6 @@ def refine_position_hybrid(
         Refined 3D position [x, y, z], or None if projection fails
     """
     ball_x, ball_y = ball_pixel
-    # if player_pixel[0] == 1217:
-    #     import pdb; pdb.set_trace()
 
     try:
         if event_type == 'ground':
@@ -255,28 +235,11 @@ def discover_trajectory_files(input_dir: Path) -> List[Path]:
     Raises:
         ValueError: If no trajectory files found or directory doesn't exist
     """
-    input_dir = Path(input_dir)
-
-    json_files = list(input_dir.glob("*_trajectory.json"))
-
-    if not json_files:
-        raise ValueError(f"No trajectory JSON files found in {input_dir}")
-
-    frame_pattern = re.compile(r'frame_(\d+)_t[\d.]+s_trajectory\.json')
-
-    files_with_numbers = []
-    for json_file in json_files:
-        match = frame_pattern.search(json_file.name)
-        if match:
-            frame_num = int(match.group(1))
-            files_with_numbers.append((frame_num, json_file))
-        else:
-            print(f"Warning: Skipping file with unexpected name: {json_file.name}")
-
-    files_with_numbers.sort(key=lambda x: x[0])
-    sorted_files = [f[1] for f in files_with_numbers]
-
-    return sorted_files
+    return discover_files_by_pattern(
+        input_dir,
+        "*_trajectory.json",
+        "Trajectory JSON"
+    )
 
 
 def extract_trajectory_data(
@@ -440,20 +403,9 @@ def create_filtered_projections_entry(
             "z": float(refined_pos[2])
         }
 
-    return {
-        "position_filtered_m": {
-            "x": float(pos[0]),
-            "y": float(pos[1]),
-            "z": float(pos[2])
-        },
-        "position_filtered_array_m": [float(pos[0]), float(pos[1]), float(pos[2])],
+    result = {
+        **serialize_vector_3d(pos, "position_filtered", "m"),
         "position_refined_m": position_refined_m,
-        "velocity_m_per_s": {
-            "vx": float(vel[0]),
-            "vy": float(vel[1]),
-            "vz": float(vel[2])
-        },
-        "velocity_array_m_per_s": [float(vel[0]), float(vel[1]), float(vel[2])],
         "filter_metadata": {
             "is_discontinuity": bool(is_discontinuity),
             "is_outlier": bool(is_outlier),
@@ -462,6 +414,12 @@ def create_filtered_projections_entry(
         },
         "event_metadata": event_metadata
     }
+
+    velocity_data = serialize_vector_3d(vel, "velocity", "m_per_s")
+    result["velocity_m_per_s"] = velocity_data["velocity_m_per_s"]
+    result["velocity_array_m_per_s"] = velocity_data["velocity_array_m_per_s"]
+
+    return result
 
 
 def update_json_files(
