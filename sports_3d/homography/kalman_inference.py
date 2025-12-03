@@ -1,14 +1,15 @@
 """
-Kalman filter inference script for 3D trajectory smoothing.
+Trajectory filtering script for 3D trajectory smoothing.
 
 Applies physics-aware filtering to existing trajectory JSON files:
-- Z-axis: Kalman filter with gravity model
+- Z-axis: Quadratic fitting with velocity decay constraint
 - X/Y-axes: Savitzky-Golay polynomial smoothing
 - Automatic discontinuity detection (bounces, hits)
 
 Usage:
     .venv/bin/python -m sports_3d.homography.kalman_inference \\
         data/sinner_ruud_trajectory \\
+        data/sinner_ruud_events \\
         --verbose --backup
 """
 
@@ -152,6 +153,7 @@ def load_events(events_dir: Path, json_files: List[Path]) -> Dict[int, Dict]:
             continue
 
         frame_num = int(match.group(1))
+        
 
         if frame_num not in trajectory_frame_numbers:
             raise ValueError(
@@ -191,6 +193,8 @@ def refine_position_hybrid(
         Refined 3D position [x, y, z], or None if projection fails
     """
     ball_x, ball_y = ball_pixel
+    # if player_pixel[0] == 1217:
+    #     import pdb; pdb.set_trace()
 
     try:
         if event_type == 'ground':
@@ -204,7 +208,7 @@ def refine_position_hybrid(
                 raise ValueError("Player pixel position required for racquet events")
 
             player_x, player_y = player_pixel
-            z_refined = pixel_to_court_plane_depth(
+            z_world = pixel_to_court_plane_depth(
                 player_x, player_y, intrinsic_matrix, extrinsic_matrix
             )
 
@@ -217,12 +221,15 @@ def refine_position_hybrid(
             camera_pos = -R.T @ t
             R_world = R.T
 
-            x_cam = (ball_x - cx_img) * z_refined / f
-            y_cam = (ball_y - cy_img) * z_refined / f
-            z_cam = z_refined
+            ray_cam = np.array([
+                (ball_x - cx_img) / f,
+                (ball_y - cy_img) / f,
+                1.0
+            ])
+            ray_world = R_world @ ray_cam
 
-            P_cam = np.array([x_cam, y_cam, z_cam])
-            P_world = camera_pos + R_world @ P_cam
+            lambda_param = (z_world - camera_pos[2]) / ray_world[2]
+            P_world = camera_pos + lambda_param * ray_world
 
             return P_world
 
@@ -347,7 +354,7 @@ def apply_kalman_filter(
     refined_positions: Dict[int, np.ndarray]
 ) -> Dict:
     """
-    Apply Kalman filter to trajectory data.
+    Apply trajectory filter to trajectory data.
 
     Args:
         timestamps: (N,) array of timestamps in seconds
@@ -367,8 +374,6 @@ def apply_kalman_filter(
             positions[frame_idx] = refined_pos
 
     trajectory_filter = TrajectoryFilter(
-        gravity=filter_params['gravity'],
-        process_noise_z=filter_params['process_noise_z'],
         window_size_xy=filter_params['window_size_xy'],
         poly_order=filter_params['poly_order'],
         verbose=verbose
@@ -509,7 +514,7 @@ def update_json_files(
 def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Apply Kalman filtering to trajectory JSON files",
+        description="Apply trajectory filtering to trajectory JSON files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -528,7 +533,7 @@ Examples:
   .venv/bin/python -m sports_3d.homography.kalman_inference \\
       data/sinner_ruud_trajectory \\
       data/sinner_ruud_events \\
-      --gravity -9.81 --window_size_xy 9 --poly_order 3 --verbose
+      --window_size_xy 9 --poly_order 3 --verbose
         """
     )
 
@@ -545,18 +550,6 @@ Examples:
     )
 
     filter_group = parser.add_argument_group("filter parameters")
-    filter_group.add_argument(
-        "--gravity",
-        type=float,
-        default=-9.81,
-        help="Gravity acceleration in m/s² (default: -9.81)"
-    )
-    filter_group.add_argument(
-        "--process_noise_z",
-        type=float,
-        default=1.0,
-        help="Process noise for Z-axis Kalman filter (default: 1.0)"
-    )
     filter_group.add_argument(
         "--window_size_xy",
         type=int,
@@ -612,8 +605,8 @@ def main():
             json_dict['camera_calibration']['principal_point_px']
         )
         extrinsic = rvec_tvec_to_extrinsic(
-            json_dict['camera_calibration']['rotation_vector'],
-            json_dict['camera_calibration']['translation_vector']
+            np.array(json_dict['camera_calibration']['rotation_vector']),
+            np.array(json_dict['camera_calibration']['translation_vector'])
         )
 
         if event_data['type'] == 'ground':
@@ -640,10 +633,8 @@ def main():
                       f"original_z={original_pos[2]:.3f}m → refined_z={refined_pos[2]:.3f}m")
 
 
-    print("\nApplying Kalman filter...")
+    print("\nApplying trajectory filter...")
     filter_params = {
-        'gravity': args.gravity,
-        'process_noise_z': args.process_noise_z,
         'window_size_xy': args.window_size_xy,
         'poly_order': args.poly_order
     }

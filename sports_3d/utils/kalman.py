@@ -1,8 +1,8 @@
 """
-Kalman filtering and trajectory smoothing for 3D sports tracking.
+Trajectory smoothing for 3D sports tracking.
 
 This module provides physics-aware filtering for noisy 3D trajectory measurements:
-- Z-axis (vertical): Kalman filter with constant acceleration (gravity) model
+- Z-axis (horizontal/depth): Quadratic fitting with velocity decay constraint
 - X/Y-axes (horizontal): Savitzky-Golay polynomial smoothing
 - Automatic detection of velocity discontinuities (bounces, hits)
 - Adaptive measurement uncertainty based on reprojection error
@@ -17,7 +17,7 @@ Usage:
     ])
 
     # Filter trajectory
-    filter = TrajectoryFilter(gravity=-9.81, window_size_xy=7, poly_order=2)
+    filter = TrajectoryFilter(window_size_xy=7, poly_order=2)
     result = filter.filter(timestamps, positions, uncertainties)
 
     # Access filtered data
@@ -90,135 +90,13 @@ def _detect_discontinuities(
     for disc_idx in discontinuity_indices:
         if disc_idx > start:
             segments.append((start, disc_idx))
-        start = disc_idx + 1
+        start = disc_idx
     if start < n_frames:
         segments.append((start, n_frames))
 
     valid_segments = [(s, e) for s, e in segments if e - s >= 3]
 
     return discontinuity_indices, valid_segments
-
-
-class KalmanFilter1D:
-    """
-    1D Kalman filter with constant acceleration model.
-
-    State vector: [position, velocity, acceleration]
-    Designed for vertical (Z-axis) motion with gravity as nominal acceleration.
-
-    Attributes:
-        state: (3,) array of [position, velocity, acceleration]
-        covariance: (3, 3) state covariance matrix
-        gravity: Acceleration due to gravity (m/s²)
-    """
-
-    def __init__(
-        self,
-        initial_position: float,
-        initial_velocity: float = 0.0,
-        gravity: float = -9.81,
-        process_noise: float = 1.0,
-        measurement_noise: float = 0.1,
-        dt: float = 0.017
-    ):
-        """
-        Initialize Kalman filter.
-
-        Args:
-            initial_position: Initial position estimate (m)
-            initial_velocity: Initial velocity estimate (m/s)
-            gravity: Acceleration due to gravity (m/s²)
-            process_noise: Process noise standard deviation for acceleration
-            measurement_noise: Initial measurement noise standard deviation (m)
-            dt: Initial time step (s)
-        """
-        self.state = np.array([initial_position, initial_velocity, gravity])
-        self.covariance = np.eye(3)
-        self.covariance[0, 0] = measurement_noise ** 2
-        self.covariance[1, 1] = 1.0
-        self.covariance[2, 2] = process_noise ** 2
-        self.gravity = gravity
-
-        self.Q = np.diag([0.01, 0.5, process_noise ** 2])
-
-    def predict(self, dt: float):
-        """
-        Predict next state using constant acceleration model.
-
-        Args:
-            dt: Time step since last update (s)
-        """
-        F = np.array([
-            [1, dt, 0.5 * dt ** 2],
-            [0, 1, dt],
-            [0, 0, 1]
-        ])
-
-        self.state = F @ self.state
-        self.covariance = F @ self.covariance @ F.T + self.Q
-
-    def update(self, measurement: float, measurement_noise: float) -> bool:
-        """
-        Update state estimate with new measurement using outlier rejection.
-
-        Uses Mahalanobis distance (3-sigma test) to reject outliers. If rejected,
-        state is not updated (prediction stands).
-
-        Args:
-            measurement: Measured position (m)
-            measurement_noise: Measurement noise standard deviation (m)
-
-        Returns:
-            True if measurement was accepted, False if rejected as outlier
-        """
-        H = np.array([[1, 0, 0]])
-        R = np.array([[measurement_noise ** 2]])
-
-        y = measurement - H @ self.state
-        S = H @ self.covariance @ H.T + R
-
-        mahal_dist = np.abs(y[0]) / np.sqrt(S[0, 0])
-        if mahal_dist > 3.0:
-            return False
-
-        K = self.covariance @ H.T @ np.linalg.inv(S)
-
-        self.state = self.state + (K @ y).flatten()
-
-        I = np.eye(3)
-        I_KH = I - K @ H
-        self.covariance = I_KH @ self.covariance @ I_KH.T + K @ R @ K.T
-
-        return True
-
-    def get_state(self) -> Tuple[float, float, float]:
-        """
-        Get current state estimate.
-
-        Returns:
-            (position, velocity, acceleration) in (m, m/s, m/s²)
-        """
-        return self.state[0], self.state[1], self.state[2]
-
-    def reset(
-        self,
-        position: float,
-        velocity: float = 0.0,
-        measurement_noise: float = 0.1
-    ):
-        """
-        Reset filter state (e.g., after discontinuity).
-
-        Args:
-            position: New position estimate (m)
-            velocity: New velocity estimate (m/s)
-            measurement_noise: Measurement uncertainty (m)
-        """
-        self.state = np.array([position, velocity, self.gravity])
-        self.covariance = np.eye(3)
-        self.covariance[0, 0] = measurement_noise ** 2
-        self.covariance[1, 1] = 1.0
-        self.covariance[2, 2] = self.Q[2, 2]
 
 
 class PolynomialSmoother:
@@ -297,14 +175,12 @@ class TrajectoryFilter:
     """
     Combined filter for 3D trajectory data.
 
-    Uses Kalman filter (with gravity) for Z-axis and polynomial smoothing for X/Y.
+    Uses quadratic fitting with velocity decay for Z-axis and polynomial smoothing for X/Y.
     Automatically detects and respects velocity discontinuities (bounces, hits).
     """
 
     def __init__(
         self,
-        gravity: float = -9.81,
-        process_noise_z: float = 1.0,
         window_size_xy: int = 7,
         poly_order: int = 2,
         verbose: bool = False
@@ -313,16 +189,11 @@ class TrajectoryFilter:
         Initialize trajectory filter.
 
         Args:
-            gravity: Acceleration due to gravity (m/s²)
-            process_noise_z: Process noise for Z-axis Kalman filter
             window_size_xy: Smoothing window size for X/Y axes
             poly_order: Polynomial order for X/Y smoothing
             verbose: Enable debug output
         """
-        self.gravity = gravity
-        self.process_noise_z = process_noise_z
         self.verbose = verbose
-
         self.poly_smoother = PolynomialSmoother(window_size_xy, poly_order)
 
     def _apply_xy_smoothing(
@@ -333,82 +204,112 @@ class TrajectoryFilter:
         """Apply polynomial smoothing to X or Y axis."""
         return self.poly_smoother.smooth(positions, segments)
 
-    def _apply_z_kalman(
+    def _apply_z_quadratic_fit(
         self,
         timestamps: np.ndarray,
         z_positions: np.ndarray,
         uncertainties: np.ndarray,
         segments: List[Tuple[int, int]]
-    ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply Kalman filter to Z-axis per-segment with outlier rejection.
+        Apply quadratic fitting to Z-axis per-segment with velocity decay constraint.
 
-        Outliers (Mahalanobis distance > 3) are rejected and linearly interpolated
-        from neighboring valid measurements.
+        Physics model: Ball travels horizontally with air resistance, velocity decays.
+        - Initial velocity is highest (from hit/bounce)
+        - Velocity magnitude should decrease over time
+        - Fit parabola z(t) = a*t^2 + b*t + c with weighted least squares
+
+        Args:
+            timestamps: (N,) array of timestamps in seconds
+            z_positions: (N,) array of Z positions in meters
+            uncertainties: (N,) array of measurement uncertainties in meters
+            segments: List of (start_idx, end_idx) for continuous segments
 
         Returns:
             z_filtered: (N,) filtered Z positions
             z_velocity: (N,) estimated Z velocities
-            rejected_indices: List of frame indices rejected as outliers
         """
         n = len(timestamps)
-        z_filtered = np.zeros(n)
+        z_filtered = np.copy(z_positions)
         z_velocity = np.zeros(n)
-        rejected_indices = []
 
         for start, end in segments:
-            if end - start < 2:
-                z_filtered[start:end] = z_positions[start:end]
+            segment_length = end - start
+
+            if segment_length < 3:
+                # Too short for quadratic fit, use raw positions
+                if segment_length >= 2:
+                    dt = timestamps[start + 1] - timestamps[start]
+                    if dt > 0:
+                        z_velocity[start] = (z_positions[start + 1] - z_positions[start]) / dt
+                        z_velocity[start + 1] = z_velocity[start]
                 continue
 
-            initial_pos = z_positions[start]
-            initial_vel = 0.0
-            if end - start >= 2:
-                dt0 = timestamps[start + 1] - timestamps[start]
-                if dt0 > 0:
-                    initial_vel = (z_positions[start + 1] - z_positions[start]) / dt0
+            # Extract segment data
+            t_seg = timestamps[start:end]
+            z_seg = z_positions[start:end]
+            unc_seg = uncertainties[start:end]
 
-            kf = KalmanFilter1D(
-                initial_position=initial_pos,
-                initial_velocity=initial_vel,
-                gravity=self.gravity,
-                process_noise=self.process_noise_z,
-                measurement_noise=uncertainties[start]
-            )
+            # Convert to relative time (starts at 0)
+            t_rel = t_seg - t_seg[0]
 
-            segment_rejected = []
+            # Weighted least squares: minimize sum((z_measured - z_fit)^2 / uncertainty^2)
+            # Fit z(t) = a*t^2 + b*t + c
+            weights = 1.0 / (unc_seg ** 2)
+            W = np.diag(weights)
 
-            for i in range(start, end):
-                if i > start:
-                    dt = timestamps[i] - timestamps[i - 1]
-                    kf.predict(dt)
+            # Design matrix: [t^2, t, 1]
+            A = np.column_stack([t_rel ** 2, t_rel, np.ones_like(t_rel)])
 
-                accepted = kf.update(z_positions[i], uncertainties[i])
-                pos, vel, _ = kf.get_state()
-                z_filtered[i] = pos
-                z_velocity[i] = vel
+            # Solve weighted least squares: (A^T W A) params = A^T W z
+            try:
+                ATA = A.T @ W @ A
+                ATb = A.T @ W @ z_seg
+                params = np.linalg.solve(ATA, ATb)
+                a, b, c = params
 
-                if not accepted:
-                    segment_rejected.append(i)
+                # Compute fitted positions and velocities
+                z_fit = a * t_rel ** 2 + b * t_rel + c
+                v_fit = 2 * a * t_rel + b  # Derivative: v(t) = 2a*t + b
 
-            rejected_indices.extend(segment_rejected)
+                # Check velocity decay constraint: |v(t_end)| should be <= |v(t_start)|
+                v_start = b  # At t=0
+                v_end = 2 * a * t_rel[-1] + b  # At t=t_end
 
-            if segment_rejected:
-                for idx in segment_rejected:
-                    valid_indices = [i for i in range(start, end) if i not in segment_rejected]
-                    if len(valid_indices) >= 2:
-                        z_filtered[idx] = np.interp(
-                            timestamps[idx],
-                            timestamps[valid_indices],
-                            z_filtered[valid_indices]
-                        )
-                        z_velocity[idx] = np.interp(
-                            timestamps[idx],
-                            timestamps[valid_indices],
-                            z_velocity[valid_indices]
-                        )
+                if abs(v_end) > abs(v_start) * 1.5:
+                    # Velocity increasing too much - likely bad fit
+                    # Fallback to linear fit: z(t) = b*t + c
+                    A_linear = np.column_stack([t_rel, np.ones_like(t_rel)])
+                    ATA_linear = A_linear.T @ W @ A_linear
+                    ATb_linear = A_linear.T @ W @ z_seg
+                    params_linear = np.linalg.solve(ATA_linear, ATb_linear)
+                    b_lin, c_lin = params_linear
 
-        return z_filtered, z_velocity, rejected_indices
+                    z_fit = b_lin * t_rel + c_lin
+                    v_fit = np.full_like(t_rel, b_lin)  # Constant velocity
+
+                    if self.verbose:
+                        print(f"  Segment [{start}, {end}): Velocity constraint violated, "
+                              f"using linear fit (v={b_lin:.2f} m/s)")
+                elif self.verbose:
+                    print(f"  Segment [{start}, {end}): Quadratic fit "
+                          f"(v_start={v_start:.2f} m/s, v_end={v_end:.2f} m/s)")
+
+                z_filtered[start:end] = z_fit
+                z_velocity[start:end] = v_fit
+
+            except np.linalg.LinAlgError:
+                # Singular matrix - fallback to raw positions
+                if self.verbose:
+                    print(f"  Segment [{start}, {end}): Fit failed, using raw positions")
+                # Velocity estimates from finite differences
+                for i in range(start, end):
+                    if i < end - 1:
+                        dt = timestamps[i + 1] - timestamps[i]
+                        if dt > 0:
+                            z_velocity[i] = (z_positions[i + 1] - z_positions[i]) / dt
+
+        return z_filtered, z_velocity
 
     def filter(
         self,
@@ -433,9 +334,9 @@ class TrajectoryFilter:
                 - velocities: (N, 3) estimated velocities
                 - x_raw, y_raw, z_raw: (N,) original positions per axis
                 - x_filtered, y_filtered, z_filtered: (N,) filtered positions
-                - z_velocity: (N,) vertical velocity from Kalman filter
+                - z_velocity: (N,) Z-axis velocity from quadratic fitting
                 - discontinuity_frames: Array of discontinuity indices
-                - outlier_frames: List of frame indices rejected as outliers
+                - outlier_frames: Empty list (kept for backwards compatibility)
                 - segments: List of (start, end) segment boundaries
         """
         n = len(timestamps)
@@ -470,7 +371,7 @@ class TrajectoryFilter:
         x_filtered = self._apply_xy_smoothing(positions[:, 0], segments)
         y_filtered = self._apply_xy_smoothing(positions[:, 1], segments)
 
-        z_filtered, z_velocity, outlier_frames = self._apply_z_kalman(
+        z_filtered, z_velocity = self._apply_z_quadratic_fit(
             timestamps,
             positions[:, 2],
             uncertainties,
@@ -502,7 +403,7 @@ class TrajectoryFilter:
             'z_filtered': z_filtered,
             'z_velocity': z_velocity,
             'discontinuity_frames': discontinuity_frames,
-            'outlier_frames': outlier_frames,
+            'outlier_frames': [],
             'segments': segments
         }
 

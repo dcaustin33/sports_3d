@@ -168,8 +168,8 @@ class KeypointInterpolator:
 
         for i, frame in enumerate(frames):
             if frame.keypoints_path is not None:
-                keypoints_2d, keypoints_3d = get_2d_and_3d_keypoints(str(frame.keypoints_path))
-                self.keypoint_cache[i] = (keypoints_2d, keypoints_3d)
+                indices, keypoints_2d, keypoints_3d = get_2d_and_3d_keypoints(str(frame.keypoints_path))
+                self.keypoint_cache[i] = (indices, keypoints_2d, keypoints_3d)
                 if self.verbose:
                     print(f"Loaded keypoints for frame {frame.frame_number} (index {i})")
 
@@ -193,8 +193,8 @@ class KeypointInterpolator:
                 return i
         return None
 
-    def _interpolate_keypoints(self, target_idx: int, prev_idx: int, next_idx: int) -> Tuple[np.ndarray, np.ndarray, str]:
-        """Linearly interpolate 2D pixel coordinates.
+    def _interpolate_keypoints(self, target_idx: int, prev_idx: int, next_idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+        """Linearly interpolate 2D pixel coordinates for matching keypoint indices.
 
         Args:
             target_idx: Target frame index
@@ -202,26 +202,51 @@ class KeypointInterpolator:
             next_idx: Next keypoint frame index
 
         Returns:
-            Tuple of (interpolated_2d, original_3d, source_label)
+            Tuple of (indices, interpolated_2d, original_3d, source_label)
+            Only keypoints present in both frames are returned.
         """
-        prev_2d, prev_3d = self.keypoint_cache[prev_idx]
-        next_2d, next_3d = self.keypoint_cache[next_idx]
+        prev_indices, prev_2d, prev_3d = self.keypoint_cache[prev_idx]
+        next_indices, next_2d, next_3d = self.keypoint_cache[next_idx]
 
-        if not np.allclose(prev_3d, next_3d):
-            raise ValueError("3D keypoint coordinates mismatch between frames")
+        # Find common keypoint indices
+        common_indices = np.intersect1d(prev_indices, next_indices)
+
+        if len(common_indices) == 0:
+            raise ValueError(f"No common keypoints between frames {prev_idx} and {next_idx}")
+
+        # Create index mappings
+        prev_mask = np.isin(prev_indices, common_indices)
+        next_mask = np.isin(next_indices, common_indices)
+
+        # Get sorted positions for matching
+        prev_argsort = np.argsort(prev_indices[prev_mask])
+        next_argsort = np.argsort(next_indices[next_mask])
+
+        # Extract matching keypoints in consistent order
+        matched_prev_2d = prev_2d[prev_mask][prev_argsort]
+        matched_next_2d = next_2d[next_mask][next_argsort]
+        matched_prev_3d = prev_3d[prev_mask][prev_argsort]
+        matched_next_3d = next_3d[next_mask][next_argsort]
+
+        # Verify 3D coordinates match
+        if not np.allclose(matched_prev_3d, matched_next_3d):
+            raise ValueError("3D keypoint coordinates mismatch for common indices")
 
         target_frame_num = self.frames[target_idx].frame_number
         prev_frame_num = self.frames[prev_idx].frame_number
         next_frame_num = self.frames[next_idx].frame_number
 
         alpha = (target_frame_num - prev_frame_num) / (next_frame_num - prev_frame_num)
-        interpolated_2d = (1 - alpha) * prev_2d + alpha * next_2d
+        interpolated_2d = (1 - alpha) * matched_prev_2d + alpha * matched_next_2d
 
         if self.verbose:
-            print(f"Interpolated keypoints for frame {target_frame_num} " +
+            print(f"Interpolated {len(common_indices)} keypoints for frame {target_frame_num} " +
                   f"(alpha={alpha:.3f} between frames {prev_frame_num} and {next_frame_num})")
+            if len(common_indices) < len(prev_indices) or len(common_indices) < len(next_indices):
+                print(f"  Dropped {len(prev_indices) - len(common_indices)} from prev, " +
+                      f"{len(next_indices) - len(common_indices)} from next")
 
-        return interpolated_2d, prev_3d, "interpolated"
+        return common_indices, interpolated_2d, matched_prev_3d, "interpolated"
 
     def get_keypoints_for_frame(self, frame_idx: int) -> Tuple[np.ndarray, np.ndarray, str]:
         """Get keypoints for a frame - direct or interpolated.
@@ -233,7 +258,7 @@ class KeypointInterpolator:
             Tuple of (keypoints_2d, keypoints_3d, source_label)
         """
         if frame_idx in self.keypoint_cache:
-            kp_2d, kp_3d = self.keypoint_cache[frame_idx]
+            indices, kp_2d, kp_3d = self.keypoint_cache[frame_idx]
             return kp_2d, kp_3d, "direct"
 
         prev_idx = self._find_previous_keypoint_frame(frame_idx)
@@ -243,18 +268,19 @@ class KeypointInterpolator:
             raise ValueError(f"No keypoints available for frame {frame_idx}")
 
         if next_idx is None:
-            kp_2d, kp_3d = self.keypoint_cache[prev_idx]
+            indices, kp_2d, kp_3d = self.keypoint_cache[prev_idx]
             if self.verbose:
                 print(f"Using previous keypoints from frame {self.frames[prev_idx].frame_number}")
             return kp_2d, kp_3d, "previous"
 
         if prev_idx is None:
-            kp_2d, kp_3d = self.keypoint_cache[next_idx]
+            indices, kp_2d, kp_3d = self.keypoint_cache[next_idx]
             if self.verbose:
                 print(f"Using next keypoints from frame {self.frames[next_idx].frame_number}")
             return kp_2d, kp_3d, "next"
 
-        return self._interpolate_keypoints(frame_idx, prev_idx, next_idx)
+        indices, kp_2d, kp_3d, source = self._interpolate_keypoints(frame_idx, prev_idx, next_idx)
+        return kp_2d, kp_3d, source
 
 
 class CalibrationManager:

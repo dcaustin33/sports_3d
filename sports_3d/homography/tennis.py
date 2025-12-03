@@ -521,14 +521,19 @@ def select_valid_solution(rvecs, tvecs, reprojErrors):
 def get_2d_and_3d_keypoints(file_path: str):
     keypoints = read_txt_file(file_path)
     keypoints = [tuple(map(float, line.split())) for line in keypoints]
+    keypoints = sorted(keypoints, key=lambda x: x[0])
+
+    indices = []
+    points_2d = []
     points_3d = []
 
     for keypoint in keypoints:
-        points_3d.append(three_d_keypoints[int(keypoint[0])])
-    points_2d = []
-    for keypoint in keypoints:
+        idx = int(keypoint[0])
+        indices.append(idx)
         points_2d.append((keypoint[1], keypoint[2]))
-    return np.array(points_2d), np.array(points_3d)
+        points_3d.append(three_d_keypoints[idx])
+
+    return np.array(indices), np.array(points_2d), np.array(points_3d)
 
 
 def estimate_depth_in_camera_plane(
@@ -695,7 +700,7 @@ if __name__ == "__main__":
     image = cv2.imread(
         f"/Users/derek/Desktop/sports_3d/data/sinner_ruud_Frames/{frame_name}.png"
     )
-    keypoints_2d, keypoints_3d = get_2d_and_3d_keypoints(keypoints_path)
+    _, keypoints_2d, keypoints_3d = get_2d_and_3d_keypoints(keypoints_path)
     min_f, max_f = estimate_focal_range(image.shape[1], image.shape[0])
     best_f, best_pose, best_error = solve_pnp_with_focal_search(
         keypoints_3d,
