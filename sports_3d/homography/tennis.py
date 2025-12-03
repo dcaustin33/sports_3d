@@ -296,7 +296,6 @@ def solve_pnp_with_focal_search(
                 best_error = error
                 best_f = f
                 best_pose = (rvec, tvec)
-
     return best_f, best_pose, best_error
 
 
@@ -518,6 +517,7 @@ def bbox_to_world_coordinates(
     image_width: int,
     image_height: int,
     object_width_m: float = 0.066,
+    flip_y_axis: bool = False,
 ) -> np.ndarray:
     """
     Convert bounding box position to 3D world coordinates.
@@ -551,5 +551,8 @@ def bbox_to_world_coordinates(
 
     P_cam = np.array([x_cam, y_cam, z_cam])
     P_world = camera_pos + R_world @ P_cam
+    
+    if flip_y_axis:
+        P_world[1] = -P_world[1]
 
     return P_world.reshape(3, 1)
