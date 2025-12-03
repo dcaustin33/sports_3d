@@ -111,7 +111,7 @@ class KeypointLabeler(BaseAnnotator):
                 if self.input_buffer:
                     try:
                         idx = int(self.input_buffer)
-                        if 0 <= idx <= 13:
+                        if 0 <= idx <= 14:
                             x, y = self.pending_point
                             self.keypoints.append((idx, x, y))
                             print(f"Added keypoint {idx} at ({x}, {y})")

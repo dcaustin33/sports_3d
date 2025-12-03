@@ -1,14 +1,15 @@
 """
-Kalman filter inference script for 3D trajectory smoothing.
+Trajectory filtering script for 3D trajectory smoothing.
 
 Applies physics-aware filtering to existing trajectory JSON files:
-- Z-axis: Kalman filter with gravity model
+- Z-axis: Quadratic fitting with velocity decay constraint
 - X/Y-axes: Savitzky-Golay polynomial smoothing
 - Automatic discontinuity detection (bounces, hits)
 
 Usage:
     .venv/bin/python -m sports_3d.homography.kalman_inference \\
         data/sinner_ruud_trajectory \\
+        data/sinner_ruud_events \\
         --verbose --backup
 """
 
@@ -21,7 +22,224 @@ from typing import Dict, List, Tuple
 import numpy as np
 from tqdm import tqdm
 
+from sports_3d.homography.tennis import (
+    build_intrinsic_matrix,
+    pixel_to_court_plane_point,
+    pixel_to_court_plane_depth,
+    rvec_tvec_to_extrinsic,
+)
 from sports_3d.utils.kalman import TrajectoryFilter, reprojection_to_3d_uncertainty
+
+
+def discover_event_files(events_dir: Path) -> List[Path]:
+    """
+    Discover and sort event annotation files.
+
+    Args:
+        events_dir: Directory containing event annotation text files
+
+    Returns:
+        List of Path objects sorted by frame number
+
+    Raises:
+        ValueError: If no event files found or directory doesn't exist
+    """
+    events_dir = Path(events_dir)
+
+    if not events_dir.exists():
+        raise ValueError(f"Events directory does not exist: {events_dir}")
+
+    txt_files = list(events_dir.glob("*_events.txt"))
+
+    if not txt_files:
+        raise ValueError(f"No event files (*_events.txt) found in {events_dir}")
+
+    frame_pattern = re.compile(r'frame_(\d+)_t[\d.]+s_events\.txt')
+
+    files_with_numbers = []
+    for txt_file in txt_files:
+        match = frame_pattern.search(txt_file.name)
+        if match:
+            frame_num = int(match.group(1))
+            files_with_numbers.append((frame_num, txt_file))
+        else:
+            print(f"Warning: Skipping file with unexpected name: {txt_file.name}")
+
+    files_with_numbers.sort(key=lambda x: x[0])
+    sorted_files = [f[1] for f in files_with_numbers]
+
+    return sorted_files
+
+
+def parse_event_file(event_path: Path) -> Dict | None:
+    """
+    Parse a single event annotation file.
+
+    Args:
+        event_path: Path to event annotation file
+
+    Returns:
+        Dictionary with event data, or None if file is empty/malformed
+            - For ground: {'type': 'ground', 'pixel': (x, y)}
+            - For racquet: {'type': 'racquet', 'ball_pixel': (x1, y1), 'player_pixel': (x2, y2)}
+    """
+    try:
+        with open(event_path, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        if not lines:
+            return None
+
+        parts = lines[0].split()
+        if len(parts) < 3:
+            print(f"Warning: Invalid event format in {event_path.name}")
+            return None
+
+        event_type = parts[0]
+
+        if event_type == 'ground' and len(parts) == 3:
+            x = float(parts[1])
+            y = float(parts[2])
+            return {'type': 'ground', 'pixel': (x, y)}
+
+        elif event_type == 'racquet' and len(parts) == 5:
+            ball_x = float(parts[1])
+            ball_y = float(parts[2])
+            player_x = float(parts[3])
+            player_y = float(parts[4])
+            return {
+                'type': 'racquet',
+                'ball_pixel': (ball_x, ball_y),
+                'player_pixel': (player_x, player_y)
+            }
+
+        else:
+            print(f"Warning: Unknown event type or invalid format in {event_path.name}")
+            return None
+
+    except Exception as e:
+        print(f"Error parsing {event_path.name}: {e}")
+        return None
+
+
+def load_events(events_dir: Path, json_files: List[Path]) -> Dict[int, Dict]:
+    """
+    Load and align event annotations with trajectory frames.
+
+    Args:
+        events_dir: Directory containing event annotation files
+        json_files: List of trajectory JSON file paths
+
+    Returns:
+        Dictionary mapping frame index to event data: {frame_idx: event_data}
+
+    Raises:
+        ValueError: If event exists but corresponding trajectory frame is missing
+    """
+    event_files = discover_event_files(events_dir)
+
+    frame_pattern = re.compile(r'frame_(\d+)_t[\d.]+s')
+    trajectory_frame_numbers = {}
+    for idx, json_file in enumerate(json_files):
+        match = frame_pattern.search(json_file.name)
+        if match:
+            frame_num = int(match.group(1))
+            trajectory_frame_numbers[frame_num] = idx
+
+    events = {}
+    for event_file in event_files:
+        match = frame_pattern.search(event_file.name)
+        if not match:
+            continue
+
+        frame_num = int(match.group(1))
+        
+
+        if frame_num not in trajectory_frame_numbers:
+            raise ValueError(
+                f"Event annotation exists for frame {frame_num} but no corresponding "
+                f"trajectory file found. Event file: {event_file.name}"
+            )
+
+        event_data = parse_event_file(event_file)
+        if event_data is not None:
+            frame_idx = trajectory_frame_numbers[frame_num]
+            events[frame_idx] = event_data
+
+    return events
+
+
+def refine_position_hybrid(
+    ball_pixel: Tuple[float, float],
+    player_pixel: Tuple[float, float] | None,
+    intrinsic_matrix: np.ndarray,
+    extrinsic_matrix: np.ndarray,
+    event_type: str
+) -> np.ndarray | None:
+    """
+    Refine 3D position using hybrid approach.
+
+    For racquet strikes: Uses ball 2D position + player z-depth (from court projection)
+    For ground bounces: Full court plane projection (y=0 constraint)
+
+    Args:
+        ball_pixel: 2D pixel coordinates of ball (x, y)
+        player_pixel: 2D pixel coordinates of player base (for z-depth), None for ground events
+        intrinsic_matrix: 3x3 camera intrinsic matrix K
+        extrinsic_matrix: 3x4 camera extrinsic matrix [R | t]
+        event_type: 'racquet' or 'ground'
+
+    Returns:
+        Refined 3D position [x, y, z], or None if projection fails
+    """
+    ball_x, ball_y = ball_pixel
+    # if player_pixel[0] == 1217:
+    #     import pdb; pdb.set_trace()
+
+    try:
+        if event_type == 'ground':
+            P_world = pixel_to_court_plane_point(
+                ball_x, ball_y, intrinsic_matrix, extrinsic_matrix
+            )
+            return P_world
+
+        elif event_type == 'racquet':
+            if player_pixel is None:
+                raise ValueError("Player pixel position required for racquet events")
+
+            player_x, player_y = player_pixel
+            z_world = pixel_to_court_plane_depth(
+                player_x, player_y, intrinsic_matrix, extrinsic_matrix
+            )
+
+            f = intrinsic_matrix[0, 0]
+            cx_img = intrinsic_matrix[0, 2]
+            cy_img = intrinsic_matrix[1, 2]
+
+            R = extrinsic_matrix[:, :3]
+            t = extrinsic_matrix[:, 3]
+            camera_pos = -R.T @ t
+            R_world = R.T
+
+            ray_cam = np.array([
+                (ball_x - cx_img) / f,
+                (ball_y - cy_img) / f,
+                1.0
+            ])
+            ray_world = R_world @ ray_cam
+
+            lambda_param = (z_world - camera_pos[2]) / ray_world[2]
+            P_world = camera_pos + lambda_param * ray_world
+
+            return P_world
+
+        else:
+            print(f"Warning: Unknown event type '{event_type}'")
+            return None
+
+    except ValueError as e:
+        print(f"Warning: Failed to refine position for {event_type} event: {e}")
+        return None
 
 
 def discover_trajectory_files(input_dir: Path) -> List[Path]:
@@ -131,10 +349,12 @@ def apply_kalman_filter(
     positions: np.ndarray,
     uncertainties: np.ndarray,
     filter_params: Dict,
-    verbose: bool
+    verbose: bool,
+    events: Dict[int, Dict],
+    refined_positions: Dict[int, np.ndarray]
 ) -> Dict:
     """
-    Apply Kalman filter to trajectory data.
+    Apply trajectory filter to trajectory data.
 
     Args:
         timestamps: (N,) array of timestamps in seconds
@@ -142,32 +362,42 @@ def apply_kalman_filter(
         uncertainties: (N,) array of uncertainties in meters
         filter_params: Dictionary of filter parameters
         verbose: Enable detailed logging
+        events: Dictionary mapping frame indices to event data
+        refined_positions: Dictionary mapping frame indices to refined 3D positions
 
     Returns:
         Filter result dictionary with filtered positions and velocities
     """
+    positions = positions.copy()
+    for frame_idx, refined_pos in refined_positions.items():
+        if 0 <= frame_idx < len(positions):
+            positions[frame_idx] = refined_pos
+
     trajectory_filter = TrajectoryFilter(
-        gravity=filter_params['gravity'],
-        process_noise_z=filter_params['process_noise_z'],
         window_size_xy=filter_params['window_size_xy'],
         poly_order=filter_params['poly_order'],
-        accel_threshold_z=filter_params['accel_threshold_z'],
-        accel_threshold_y=filter_params['accel_threshold_y'],
         verbose=verbose
     )
 
-    result = trajectory_filter.filter(timestamps, positions, uncertainties)
+    result = trajectory_filter.filter(timestamps, positions, uncertainties, event_dict=events)
 
     return result
 
 
-def create_filtered_projections_entry(frame_idx: int, filter_result: Dict) -> Dict:
+def create_filtered_projections_entry(
+    frame_idx: int,
+    filter_result: Dict,
+    events: Dict[int, Dict],
+    refined_positions: Dict[int, np.ndarray]
+) -> Dict:
     """
     Create filtered_projections entry for a single frame.
 
     Args:
         frame_idx: Index of the frame in the trajectory sequence
         filter_result: Dictionary returned by TrajectoryFilter.filter()
+        events: Dictionary mapping frame indices to event data
+        refined_positions: Dictionary mapping frame indices to refined positions
 
     Returns:
         Dictionary with filtered position, velocity, and metadata
@@ -186,6 +416,30 @@ def create_filtered_projections_entry(frame_idx: int, filter_result: Dict) -> Di
             segment_bounds = [int(start), int(end)]
             break
 
+    event_metadata = None
+    if frame_idx in events:
+        event_data = events[frame_idx]
+        if event_data['type'] == 'ground':
+            event_metadata = {
+                "event_type": "ground",
+                "pixel_coords": list(event_data['pixel'])
+            }
+        elif event_data['type'] == 'racquet':
+            event_metadata = {
+                "event_type": "racquet",
+                "ball_pixel": list(event_data['ball_pixel']),
+                "player_pixel": list(event_data['player_pixel'])
+            }
+
+    position_refined_m = None
+    if frame_idx in refined_positions:
+        refined_pos = refined_positions[frame_idx]
+        position_refined_m = {
+            "x": float(refined_pos[0]),
+            "y": float(refined_pos[1]),
+            "z": float(refined_pos[2])
+        }
+
     return {
         "position_filtered_m": {
             "x": float(pos[0]),
@@ -193,6 +447,7 @@ def create_filtered_projections_entry(frame_idx: int, filter_result: Dict) -> Di
             "z": float(pos[2])
         },
         "position_filtered_array_m": [float(pos[0]), float(pos[1]), float(pos[2])],
+        "position_refined_m": position_refined_m,
         "velocity_m_per_s": {
             "vx": float(vel[0]),
             "vy": float(vel[1]),
@@ -204,7 +459,8 @@ def create_filtered_projections_entry(frame_idx: int, filter_result: Dict) -> Di
             "is_outlier": bool(is_outlier),
             "segment_index": segment_index,
             "segment_bounds": segment_bounds
-        }
+        },
+        "event_metadata": event_metadata
     }
 
 
@@ -213,7 +469,8 @@ def update_json_files(
     json_dicts: List[dict],
     filter_result: Dict,
     backup: bool,
-    dry_run: bool
+    events: Dict[int, Dict],
+    refined_positions: Dict[int, np.ndarray]
 ) -> None:
     """
     Update JSON files with filtered projections.
@@ -223,10 +480,13 @@ def update_json_files(
         json_dicts: List of original JSON dictionaries
         filter_result: Filter result dictionary
         backup: Create backup files before overwriting
-        dry_run: Preview changes without writing
+        events: Dictionary mapping frame indices to event data
+        refined_positions: Dictionary mapping frame indices to refined positions
     """
     for i, (json_file, json_dict) in tqdm(enumerate(zip(json_files, json_dicts))):
-        filtered_entry = create_filtered_projections_entry(i, filter_result)
+        filtered_entry = create_filtered_projections_entry(
+            i, filter_result, events, refined_positions
+        )
         json_dict['filtered_projections'] = filtered_entry
 
         if backup:
@@ -254,26 +514,26 @@ def update_json_files(
 def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Apply Kalman filtering to trajectory JSON files",
+        description="Apply trajectory filtering to trajectory JSON files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Basic usage
   .venv/bin/python -m sports_3d.homography.kalman_inference \\
-      data/sinner_ruud_trajectory
+      data/sinner_ruud_trajectory \\
+      data/sinner_ruud_events
 
   # With backup and verbose output
   .venv/bin/python -m sports_3d.homography.kalman_inference \\
-      data/sinner_ruud_trajectory --backup --verbose
-
-  # Dry run to preview changes
-  .venv/bin/python -m sports_3d.homography.kalman_inference \\
-      data/sinner_ruud_trajectory --dry_run --verbose
+      data/sinner_ruud_trajectory \\
+      data/sinner_ruud_events \\
+      --backup --verbose
 
   # Custom filter parameters
   .venv/bin/python -m sports_3d.homography.kalman_inference \\
       data/sinner_ruud_trajectory \\
-      --gravity -9.81 --window_size_xy 9 --poly_order 3 --verbose
+      data/sinner_ruud_events \\
+      --window_size_xy 9 --poly_order 3 --verbose
         """
     )
 
@@ -283,19 +543,13 @@ Examples:
         help="Directory containing trajectory JSON files"
     )
 
+    parser.add_argument(
+        "events_dir",
+        type=Path,
+        help="Directory containing event annotation files (*_events.txt)"
+    )
+
     filter_group = parser.add_argument_group("filter parameters")
-    filter_group.add_argument(
-        "--gravity",
-        type=float,
-        default=-9.81,
-        help="Gravity acceleration in m/s² (default: -9.81)"
-    )
-    filter_group.add_argument(
-        "--process_noise_z",
-        type=float,
-        default=1.0,
-        help="Process noise for Z-axis Kalman filter (default: 1.0)"
-    )
     filter_group.add_argument(
         "--window_size_xy",
         type=int,
@@ -308,28 +562,11 @@ Examples:
         default=2,
         help="Polynomial order for X/Y smoothing (default: 2)"
     )
-    filter_group.add_argument(
-        "--accel_threshold_z",
-        type=float,
-        default=200.0,
-        help="Z-axis acceleration threshold for discontinuity detection in m/s² (default: 200.0)"
-    )
-    filter_group.add_argument(
-        "--accel_threshold_y",
-        type=float,
-        default=150.0,
-        help="Y-axis acceleration threshold for discontinuity detection in m/s² (default: 150.0)"
-    )
 
     parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable detailed logging"
-    )
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Preview changes without modifying files"
     )
     parser.add_argument(
         "--backup",
@@ -355,19 +592,58 @@ def main():
     timestamps, positions, uncertainties, json_dicts = extract_trajectory_data(json_files)
     print(f"Loaded {len(timestamps)} frames")
 
-    print("\nApplying Kalman filter...")
+    print("\nLoading event annotations...")
+    events = load_events(args.events_dir, json_files)
+    print(f"Loaded {len(events)} event annotations")
+
+    print("Refining positions using event annotations...")
+    refined_positions = {}
+    for frame_idx, event_data in events.items():
+        json_dict = json_dicts[frame_idx]
+        K = build_intrinsic_matrix(
+            json_dict['camera_calibration']['focal_length_px'],
+            json_dict['camera_calibration']['principal_point_px']
+        )
+        extrinsic = rvec_tvec_to_extrinsic(
+            np.array(json_dict['camera_calibration']['rotation_vector']),
+            np.array(json_dict['camera_calibration']['translation_vector'])
+        )
+
+        if event_data['type'] == 'ground':
+            ball_pixel = event_data['pixel']
+            player_pixel = None
+        else:
+            ball_pixel = event_data['ball_pixel']
+            player_pixel = event_data['player_pixel']
+
+        refined_pos = refine_position_hybrid(
+            ball_pixel,
+            player_pixel,
+            K,
+            extrinsic,
+            event_data['type']
+        )
+
+        if refined_pos is not None:
+            refined_positions[frame_idx] = refined_pos
+
+            if args.verbose:
+                original_pos = positions[frame_idx]
+                print(f"  Frame {frame_idx} ({event_data['type']}): "
+                      f"original_z={original_pos[2]:.3f}m → refined_z={refined_pos[2]:.3f}m")
+
+
+    print("\nApplying trajectory filter...")
     filter_params = {
-        'gravity': args.gravity,
-        'process_noise_z': args.process_noise_z,
         'window_size_xy': args.window_size_xy,
-        'poly_order': args.poly_order,
-        'accel_threshold_z': args.accel_threshold_z,
-        'accel_threshold_y': args.accel_threshold_y
+        'poly_order': args.poly_order
     }
 
     filter_result = apply_kalman_filter(
         timestamps, positions, uncertainties,
-        filter_params, args.verbose
+        filter_params, args.verbose,
+        events=events,
+        refined_positions=refined_positions
     )
 
     print(f"\nFilter Results:")
@@ -381,22 +657,17 @@ def main():
     for i, (start, end) in enumerate(filter_result['segments']):
         print(f"    Segment {i}: frames {start}-{end-1} ({end-start} frames)")
 
-    mode = "DRY RUN" if args.dry_run else "Writing"
     backup_msg = " (with backup)" if args.backup else ""
-    print(f"\n{mode}: Updating JSON files{backup_msg}...")
+    print(f"\nUpdating JSON files{backup_msg}...")
 
     update_json_files(
         json_files, json_dicts, filter_result,
-        args.backup, args.dry_run
+        args.backup, events, refined_positions
     )
 
-    if args.dry_run:
-        print("\nDry run complete! No files were modified.")
-        print("Remove --dry_run flag to apply changes.")
-    else:
-        print(f"\nComplete! Updated {len(json_files)} files.")
-        if args.backup:
-            print(f"Backups saved as *.json.bak")
+    print(f"\nComplete! Updated {len(json_files)} files.")
+    if args.backup:
+        print(f"Backups saved as *.json.bak")
 
 
 if __name__ == "__main__":

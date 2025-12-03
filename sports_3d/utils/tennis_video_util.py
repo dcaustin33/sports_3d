@@ -75,7 +75,6 @@ def discover_video_data(frames_dir: Path, trajectory_dir: Path) -> List[FrameDat
         json_file = trajectory_dir / f"{base_name}_trajectory.json"
 
         if not json_file.exists():
-            print(f"Warning: No trajectory JSON for {frame_file.name}, skipping")
             continue
 
         try:
