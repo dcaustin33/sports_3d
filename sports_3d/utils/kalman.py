@@ -2,8 +2,9 @@
 Trajectory smoothing for 3D sports tracking.
 
 This module provides physics-aware filtering for noisy 3D trajectory measurements:
-- Z-axis (horizontal/depth): Quadratic fitting with velocity decay constraint
-- X/Y-axes (horizontal): Savitzky-Golay polynomial smoothing
+- Z-axis (depth): Exponential decay model anchored at event endpoints (monotonic)
+- X-axis (lateral): Quadratic fit anchored at endpoints (allows spin curve, no weaving)
+- Y-axis (vertical): Ballistic model anchored at event endpoints (single parabola)
 - Automatic detection of velocity discontinuities (bounces, hits)
 - Adaptive measurement uncertainty based on reprojection error
 
@@ -70,6 +71,8 @@ def _detect_discontinuities(
     Detect velocity discontinuities using event annotations.
 
     Uses event frames as ground truth discontinuities to split trajectory into segments.
+    Event frames are included in BOTH the incoming and outgoing segments so that
+    fits are anchored to the ground truth positions at discontinuities.
 
     Args:
         n_frames: Total number of frames in trajectory
@@ -88,8 +91,8 @@ def _detect_discontinuities(
     segments = []
     start = 0
     for disc_idx in discontinuity_indices:
-        if disc_idx > start:
-            segments.append((start, disc_idx))
+        if disc_idx >= start:
+            segments.append((start, disc_idx + 1))
         start = disc_idx
     if start < n_frames:
         segments.append((start, n_frames))
@@ -175,8 +178,9 @@ class TrajectoryFilter:
     """
     Combined filter for 3D trajectory data.
 
-    Uses quadratic fitting with velocity decay for Z-axis and polynomial smoothing for X/Y.
-    Automatically detects and respects velocity discontinuities (bounces, hits).
+    Uses exponential decay model for Z-axis (monotonic), quadratic fit for X-axis
+    (single curve, no weaving), and ballistic model for Y-axis.
+    Event positions anchor segment endpoints for X, Y, and Z.
     """
 
     def __init__(
@@ -196,15 +200,178 @@ class TrajectoryFilter:
         self.verbose = verbose
         self.poly_smoother = PolynomialSmoother(window_size_xy, poly_order)
 
-    def _apply_xy_smoothing(
+    def _apply_y_smoothing(
         self,
         positions: np.ndarray,
         segments: List[Tuple[int, int]]
     ) -> np.ndarray:
-        """Apply polynomial smoothing to X or Y axis."""
+        """Apply polynomial smoothing to Y axis."""
         return self.poly_smoother.smooth(positions, segments)
 
-    def _apply_z_quadratic_fit(
+    def _apply_x_quadratic_fit(
+        self,
+        timestamps: np.ndarray,
+        x_positions: np.ndarray,
+        uncertainties: np.ndarray,
+        segments: List[Tuple[int, int]]
+    ) -> np.ndarray:
+        """
+        Apply quadratic fit to X-axis per-segment, anchored at endpoints.
+
+        Model: x(t) = x_start + (x_end - x_start) * (t/T) + a * t * (T - t)
+        - Linear interpolation between endpoints
+        - Parabolic "bulge" term that's zero at both endpoints
+        - Single parameter 'a' controls curvature (spin effect)
+
+        This guarantees no weaving - a parabola can only curve one direction.
+
+        Args:
+            timestamps: (N,) array of timestamps in seconds
+            x_positions: (N,) array of X positions in meters
+            uncertainties: (N,) array of measurement uncertainties in meters
+            segments: List of (start_idx, end_idx) for continuous segments
+
+        Returns:
+            x_filtered: (N,) filtered X positions
+        """
+        x_filtered = np.copy(x_positions)
+
+        for start, end in segments:
+            segment_length = end - start
+
+            if segment_length < 2:
+                continue
+
+            if segment_length == 2:
+                continue
+
+            t_seg = timestamps[start:end]
+            x_seg = x_positions[start:end]
+            unc_seg = uncertainties[start:end]
+
+            t_rel = t_seg - t_seg[0]
+            T = t_rel[-1]
+
+            x_start = x_seg[0]
+            x_end = x_seg[-1]
+            delta_x = x_end - x_start
+
+            interior_mask = (t_rel > 0) & (t_rel < T)
+            if not np.any(interior_mask):
+                x_filtered[start:end] = x_start + delta_x * t_rel / T
+                continue
+
+            t_interior = t_rel[interior_mask]
+            x_interior = x_seg[interior_mask]
+            w_interior = 1.0 / (unc_seg[interior_mask] ** 2)
+
+            x_linear_interior = x_start + delta_x * t_interior / T
+            residuals = x_interior - x_linear_interior
+
+            basis = t_interior * (T - t_interior)
+
+            numerator = np.sum(w_interior * residuals * basis)
+            denominator = np.sum(w_interior * basis ** 2)
+
+            if abs(denominator) > 1e-10:
+                a = numerator / denominator
+            else:
+                a = 0.0
+
+            x_fit = x_start + delta_x * t_rel / T + a * t_rel * (T - t_rel)
+            x_filtered[start:end] = x_fit
+
+            if self.verbose:
+                print(f"  Segment [{start}, {end}): X quadratic fit (curvature a={a:.4f})")
+
+        return x_filtered
+
+    def _apply_y_ballistic(
+        self,
+        timestamps: np.ndarray,
+        y_positions: np.ndarray,
+        uncertainties: np.ndarray,
+        segments: List[Tuple[int, int]]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply ballistic model to Y-axis per-segment, anchored at endpoints.
+
+        Physics model: Ball vertical motion under effective gravity.
+        y(t) = y_start + v_y0*t - (1/2)*g_eff*t²
+        v(t) = v_y0 - g_eff*t
+
+        The model is anchored at segment endpoints (event positions are ground truth).
+        This guarantees single-parabola motion between events (no multi-peak artifacts).
+
+        Args:
+            timestamps: (N,) array of timestamps in seconds
+            y_positions: (N,) array of Y positions in meters
+            uncertainties: (N,) array of measurement uncertainties in meters
+            segments: List of (start_idx, end_idx) for continuous segments
+
+        Returns:
+            y_filtered: (N,) filtered Y positions
+            y_velocity: (N,) estimated Y velocities
+        """
+        n = len(timestamps)
+        y_filtered = np.copy(y_positions)
+        y_velocity = np.zeros(n)
+
+        for start, end in segments:
+            segment_length = end - start
+
+            if segment_length < 2:
+                continue
+
+            if segment_length == 2:
+                dt = timestamps[start + 1] - timestamps[start]
+                if dt > 0:
+                    v = (y_positions[start + 1] - y_positions[start]) / dt
+                    y_velocity[start] = v
+                    y_velocity[start + 1] = v
+                continue
+
+            t_seg = timestamps[start:end]
+            y_seg = y_positions[start:end]
+
+            t_rel = t_seg - t_seg[0]
+            T = t_rel[-1]
+
+            y_start = y_seg[0]
+            y_end = y_seg[-1]
+            delta_y = y_end - y_start
+
+            if abs(delta_y) < 1e-6:
+                y_filtered[start:end] = y_start
+                y_velocity[start:end] = 0.0
+                continue
+
+            g_eff = self._fit_gravity_constant(
+                t_rel, y_seg, y_start, delta_y, T, uncertainties[start:end]
+            )
+
+            if g_eff > 1e-6:
+                v_y0 = delta_y / T + 0.5 * g_eff * T
+
+                y_fit = y_start + v_y0 * t_rel - 0.5 * g_eff * (t_rel ** 2)
+                v_fit = v_y0 - g_eff * t_rel
+            else:
+                v_const = delta_y / T
+                y_fit = y_start + v_const * t_rel
+                v_fit = np.full_like(t_rel, v_const)
+
+            y_filtered[start:end] = y_fit
+            y_velocity[start:end] = v_fit
+
+            if self.verbose:
+                v_start = v_fit[0]
+                v_end = v_fit[-1]
+                print(f"  Segment [{start}, {end}): Ballistic fit "
+                      f"(g_eff={g_eff:.3f} m/s², v_start={v_start:.2f} m/s, v_end={v_end:.2f} m/s)")
+
+        return y_filtered, y_velocity
+
+    def _apply_z_exponential_decay(
         self,
         timestamps: np.ndarray,
         z_positions: np.ndarray,
@@ -212,12 +379,14 @@ class TrajectoryFilter:
         segments: List[Tuple[int, int]]
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply quadratic fitting to Z-axis per-segment with velocity decay constraint.
+        Apply exponential decay model to Z-axis per-segment.
 
-        Physics model: Ball travels horizontally with air resistance, velocity decays.
-        - Initial velocity is highest (from hit/bounce)
-        - Velocity magnitude should decrease over time
-        - Fit parabola z(t) = a*t^2 + b*t + c with weighted least squares
+        Physics model: Ball travels with air resistance causing velocity decay.
+        z(t) = z0 + (v0/k) * (1 - e^(-k*t))
+        v(t) = v0 * e^(-k*t)
+
+        The model is anchored at segment endpoints (event positions are ground truth).
+        This guarantees monotonic motion between events.
 
         Args:
             timestamps: (N,) array of timestamps in seconds
@@ -236,80 +405,179 @@ class TrajectoryFilter:
         for start, end in segments:
             segment_length = end - start
 
-            if segment_length < 3:
-                # Too short for quadratic fit, use raw positions
-                if segment_length >= 2:
-                    dt = timestamps[start + 1] - timestamps[start]
-                    if dt > 0:
-                        z_velocity[start] = (z_positions[start + 1] - z_positions[start]) / dt
-                        z_velocity[start + 1] = z_velocity[start]
+            if segment_length < 2:
                 continue
 
-            # Extract segment data
+            if segment_length == 2:
+                dt = timestamps[start + 1] - timestamps[start]
+                if dt > 0:
+                    v = (z_positions[start + 1] - z_positions[start]) / dt
+                    z_velocity[start] = v
+                    z_velocity[start + 1] = v
+                continue
+
             t_seg = timestamps[start:end]
             z_seg = z_positions[start:end]
-            unc_seg = uncertainties[start:end]
 
-            # Convert to relative time (starts at 0)
             t_rel = t_seg - t_seg[0]
+            T = t_rel[-1]
 
-            # Weighted least squares: minimize sum((z_measured - z_fit)^2 / uncertainty^2)
-            # Fit z(t) = a*t^2 + b*t + c
-            weights = 1.0 / (unc_seg ** 2)
-            W = np.diag(weights)
+            z_start = z_seg[0]
+            z_end = z_seg[-1]
+            delta_z = z_end - z_start
 
-            # Design matrix: [t^2, t, 1]
-            A = np.column_stack([t_rel ** 2, t_rel, np.ones_like(t_rel)])
+            if abs(delta_z) < 1e-6:
+                z_filtered[start:end] = z_start
+                z_velocity[start:end] = 0.0
+                continue
 
-            # Solve weighted least squares: (A^T W A) params = A^T W z
-            try:
-                ATA = A.T @ W @ A
-                ATb = A.T @ W @ z_seg
-                params = np.linalg.solve(ATA, ATb)
-                a, b, c = params
+            k = self._fit_decay_constant(t_rel, z_seg, z_start, delta_z, T, uncertainties[start:end])
 
-                # Compute fitted positions and velocities
-                z_fit = a * t_rel ** 2 + b * t_rel + c
-                v_fit = 2 * a * t_rel + b  # Derivative: v(t) = 2a*t + b
+            if k > 1e-6:
+                def z_model(t):
+                    return z_start + delta_z * (1 - np.exp(-k * t)) / (1 - np.exp(-k * T))
 
-                # Check velocity decay constraint: |v(t_end)| should be <= |v(t_start)|
-                v_start = b  # At t=0
-                v_end = 2 * a * t_rel[-1] + b  # At t=t_end
+                def v_model(t):
+                    v0 = delta_z * k / (1 - np.exp(-k * T))
+                    return v0 * np.exp(-k * t)
 
-                if abs(v_end) > abs(v_start) * 1.5:
-                    # Velocity increasing too much - likely bad fit
-                    # Fallback to linear fit: z(t) = b*t + c
-                    A_linear = np.column_stack([t_rel, np.ones_like(t_rel)])
-                    ATA_linear = A_linear.T @ W @ A_linear
-                    ATb_linear = A_linear.T @ W @ z_seg
-                    params_linear = np.linalg.solve(ATA_linear, ATb_linear)
-                    b_lin, c_lin = params_linear
+                z_fit = z_model(t_rel)
+                v_fit = v_model(t_rel)
+            else:
+                v_const = delta_z / T
+                z_fit = z_start + v_const * t_rel
+                v_fit = np.full_like(t_rel, v_const)
 
-                    z_fit = b_lin * t_rel + c_lin
-                    v_fit = np.full_like(t_rel, b_lin)  # Constant velocity
+            z_filtered[start:end] = z_fit
+            z_velocity[start:end] = v_fit
 
-                    if self.verbose:
-                        print(f"  Segment [{start}, {end}): Velocity constraint violated, "
-                              f"using linear fit (v={b_lin:.2f} m/s)")
-                elif self.verbose:
-                    print(f"  Segment [{start}, {end}): Quadratic fit "
-                          f"(v_start={v_start:.2f} m/s, v_end={v_end:.2f} m/s)")
-
-                z_filtered[start:end] = z_fit
-                z_velocity[start:end] = v_fit
-
-            except np.linalg.LinAlgError:
-                # Singular matrix - fallback to raw positions
-                if self.verbose:
-                    print(f"  Segment [{start}, {end}): Fit failed, using raw positions")
-                # Velocity estimates from finite differences
-                for i in range(start, end):
-                    if i < end - 1:
-                        dt = timestamps[i + 1] - timestamps[i]
-                        if dt > 0:
-                            z_velocity[i] = (z_positions[i + 1] - z_positions[i]) / dt
+            if self.verbose:
+                v_start = v_fit[0]
+                v_end = v_fit[-1]
+                print(f"  Segment [{start}, {end}): Exponential decay fit "
+                      f"(k={k:.3f}, v_start={v_start:.2f} m/s, v_end={v_end:.2f} m/s)")
 
         return z_filtered, z_velocity
+
+    def _fit_decay_constant(
+        self,
+        t_rel: np.ndarray,
+        z_seg: np.ndarray,
+        z_start: float,
+        delta_z: float,
+        T: float,
+        uncertainties: np.ndarray
+    ) -> float:
+        """
+        Fit the decay constant k using weighted least squares on interior points.
+
+        The model is: z(t) = z_start + delta_z * (1 - e^(-k*t)) / (1 - e^(-k*T))
+        This is anchored at endpoints, so we fit k to minimize error on interior points.
+
+        Args:
+            t_rel: Relative timestamps (starting at 0)
+            z_seg: Z positions for this segment
+            z_start: Starting Z position (anchor)
+            delta_z: Total Z displacement (z_end - z_start)
+            T: Total segment duration
+            uncertainties: Measurement uncertainties
+
+        Returns:
+            Optimal decay constant k (0 means use linear interpolation)
+        """
+        if len(t_rel) <= 2:
+            return 0.0
+
+        interior_mask = (t_rel > 0) & (t_rel < T)
+        if not np.any(interior_mask):
+            return 0.0
+
+        t_interior = t_rel[interior_mask]
+        z_interior = z_seg[interior_mask]
+        w_interior = 1.0 / (uncertainties[interior_mask] ** 2)
+
+        best_k = 0.0
+        best_error = float('inf')
+
+        for k in np.linspace(0.1, 5.0, 50):
+            denom = 1 - np.exp(-k * T)
+            if abs(denom) < 1e-10:
+                continue
+
+            z_pred = z_start + delta_z * (1 - np.exp(-k * t_interior)) / denom
+            error = np.sum(w_interior * (z_pred - z_interior) ** 2)
+
+            if error < best_error:
+                best_error = error
+                best_k = k
+
+        z_linear = z_start + delta_z * t_interior / T
+        linear_error = np.sum(w_interior * (z_linear - z_interior) ** 2)
+
+        if linear_error <= best_error:
+            return 0.0
+
+        return best_k
+
+    def _fit_gravity_constant(
+        self,
+        t_rel: np.ndarray,
+        y_seg: np.ndarray,
+        y_start: float,
+        delta_y: float,
+        T: float,
+        uncertainties: np.ndarray
+    ) -> float:
+        """
+        Fit effective gravity constant g_eff using weighted least squares on interior points.
+
+        The model is: y(t) = y_start + v_y0*t - (1/2)*g_eff*t²
+        Where v_y0 = delta_y/T + (1/2)*g_eff*T (from endpoint constraint)
+
+        This is anchored at endpoints, so we fit g_eff to minimize error on interior points.
+
+        Args:
+            t_rel: Relative timestamps (starting at 0)
+            y_seg: Y positions for this segment
+            y_start: Starting Y position (anchor)
+            delta_y: Total Y displacement (y_end - y_start)
+            T: Total segment duration
+            uncertainties: Measurement uncertainties
+
+        Returns:
+            Optimal gravity constant g_eff in m/s² (0 means use linear interpolation)
+        """
+        if len(t_rel) <= 2:
+            return 0.0
+
+        interior_mask = (t_rel > 0) & (t_rel < T)
+        if not np.any(interior_mask):
+            return 0.0
+
+        t_interior = t_rel[interior_mask]
+        y_interior = y_seg[interior_mask]
+        w_interior = 1.0 / (uncertainties[interior_mask] ** 2)
+
+        best_g = 0.0
+        best_error = float('inf')
+
+        for g_eff in np.linspace(5.0, 15.0, 50):
+            v_y0 = delta_y / T + 0.5 * g_eff * T
+
+            y_pred = y_start + v_y0 * t_interior - 0.5 * g_eff * (t_interior ** 2)
+            error = np.sum(w_interior * (y_pred - y_interior) ** 2)
+
+            if error < best_error:
+                best_error = error
+                best_g = g_eff
+
+        y_linear = y_start + delta_y * t_interior / T
+        linear_error = np.sum(w_interior * (y_linear - y_interior) ** 2)
+
+        if linear_error <= best_error:
+            return 0.0
+
+        return best_g
 
     def filter(
         self,
@@ -334,7 +602,8 @@ class TrajectoryFilter:
                 - velocities: (N, 3) estimated velocities
                 - x_raw, y_raw, z_raw: (N,) original positions per axis
                 - x_filtered, y_filtered, z_filtered: (N,) filtered positions
-                - z_velocity: (N,) Z-axis velocity from quadratic fitting
+                - y_velocity: (N,) Y-axis velocity from ballistic fitting
+                - z_velocity: (N,) Z-axis velocity from exponential decay
                 - discontinuity_frames: Array of discontinuity indices
                 - outlier_frames: Empty list (kept for backwards compatibility)
                 - segments: List of (start, end) segment boundaries
@@ -358,6 +627,7 @@ class TrajectoryFilter:
                 'x_filtered': positions[:, 0],
                 'y_filtered': positions[:, 1],
                 'z_filtered': positions[:, 2],
+                'y_velocity': np.zeros(n),
                 'z_velocity': np.zeros(n),
                 'discontinuity_frames': discontinuity_frames,
                 'outlier_frames': [],
@@ -368,10 +638,20 @@ class TrajectoryFilter:
             print(f"Detected {len(discontinuity_frames)} discontinuities at frames: {discontinuity_frames}")
             print(f"Trajectory split into {len(segments)} segments: {segments}")
 
-        x_filtered = self._apply_xy_smoothing(positions[:, 0], segments)
-        y_filtered = self._apply_xy_smoothing(positions[:, 1], segments)
+        x_filtered = self._apply_x_quadratic_fit(
+            timestamps,
+            positions[:, 0],
+            uncertainties,
+            segments
+        )
+        y_filtered, y_velocity = self._apply_y_ballistic(
+            timestamps,
+            positions[:, 1],
+            uncertainties,
+            segments
+        )
 
-        z_filtered, z_velocity = self._apply_z_quadratic_fit(
+        z_filtered, z_velocity = self._apply_z_exponential_decay(
             timestamps,
             positions[:, 2],
             uncertainties,
@@ -385,7 +665,7 @@ class TrajectoryFilter:
             dt = timestamps[i + 1] - timestamps[i - 1]
             if dt > 0:
                 velocities[i, 0] = (x_filtered[i + 1] - x_filtered[i - 1]) / dt
-                velocities[i, 1] = (y_filtered[i + 1] - y_filtered[i - 1]) / dt
+        velocities[:, 1] = y_velocity
         velocities[:, 2] = z_velocity
 
         velocities[0] = velocities[1]
@@ -401,6 +681,7 @@ class TrajectoryFilter:
             'x_filtered': x_filtered,
             'y_filtered': y_filtered,
             'z_filtered': z_filtered,
+            'y_velocity': y_velocity,
             'z_velocity': z_velocity,
             'discontinuity_frames': discontinuity_frames,
             'outlier_frames': [],

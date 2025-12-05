@@ -5,7 +5,9 @@
       "Bash(.venv/bin/python:*)",
       "Skill(github-code-review)",
       "Bash(xargs ls:*)",
-      "Skill(code-refactor)"
+      "Skill(code-refactor)",
+      "Bash(cat:*)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []
