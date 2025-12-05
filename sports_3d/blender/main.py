@@ -20,22 +20,23 @@ Usage (from command line):
         --camera_z -20.0
 """
 
-import bpy
 import sys
 from pathlib import Path
+
+import bpy
 
 # Add project root to path for imports when running from Blender
 project_root = Path(__file__).parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from sports_3d.blender.config import BlenderConfig, get_default_config
-from sports_3d.blender.data_loader import load_trajectory_data, get_position_bounds
-from sports_3d.blender.court import create_tennis_court
 from sports_3d.blender.ball import create_animated_ball_with_trail, create_ball_parent
-from sports_3d.blender.camera import setup_main_camera, create_camera_presets, create_camera_parent
+from sports_3d.blender.camera import create_camera_parent, create_camera_presets, setup_main_camera
+from sports_3d.blender.config import BlenderConfig, get_default_config
+from sports_3d.blender.court import create_tennis_court
+from sports_3d.blender.data_loader import get_position_bounds, load_trajectory_data
 from sports_3d.blender.environment import setup_environment
-from sports_3d.blender.render import configure_eevee, set_output_path
+from sports_3d.blender.render import configure_eevee
 
 
 def clear_scene() -> None:
@@ -125,12 +126,14 @@ def run(config: BlenderConfig = None) -> None:
 
     # Step 7: Configure render settings
     print_step(7, total_steps, "Configuring render settings...")
-    configure_eevee(config, len(positions))
+    total_frames = len(positions) + config.trail_length
+    configure_eevee(config, total_frames)
 
     # Print summary
     print_header("SETUP COMPLETE!")
-    print(f"\nAnimation: {len(positions)} frames at {config.fps} fps")
-    print(f"Duration: {len(positions) / config.fps:.2f} seconds")
+    print(f"\nAnimation: {total_frames} frames at {config.fps} fps")
+    print(f"Duration: {total_frames / config.fps:.2f} seconds")
+    print(f"  ({len(positions)} trajectory + {config.trail_length} trail frames)")
     print(f"\nCamera position: {config.camera_position}")
     print(f"Looking at: {config.camera_look_at}")
 

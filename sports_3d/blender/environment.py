@@ -5,9 +5,10 @@ Configures sky background, sun lighting, and fill lights for
 a realistic outdoor tennis court environment.
 """
 
-import bpy
 import math
 from typing import Optional
+
+import bpy
 
 from .config import BlenderConfig
 

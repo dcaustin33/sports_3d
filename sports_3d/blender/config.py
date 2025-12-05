@@ -5,7 +5,7 @@ Contains all configurable parameters for the visualization including
 court dimensions, colors, camera settings, and render options.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Tuple
 
 
@@ -63,8 +63,6 @@ class BlenderConfig:
     # Render settings (EEVEE)
     render_samples: int = 64
     output_resolution: Tuple[int, int] = (1920, 1080)
-    use_bloom: bool = True
-    bloom_intensity: float = 0.05
     use_ambient_occlusion: bool = True
 
     # Derived properties

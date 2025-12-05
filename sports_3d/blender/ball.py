@@ -5,8 +5,9 @@ Creates tennis ball meshes and handles keyframe animation for
 trajectory visualization, including ghost ball trail effect.
 """
 
-import bpy
 from typing import List, Tuple
+
+import bpy
 
 from .config import BlenderConfig
 from .materials import create_ball_material, create_transparent_material
@@ -154,12 +155,9 @@ def animate_trail_ball(
         offset: Number of frames behind main ball
         start_frame: First frame number
     """
-    # Create offset positions (pad with off-screen position)
+    # Create offset positions (pad beginning with off-screen position)
     off_screen = (0, -100, 0)
     offset_positions = [off_screen] * offset + list(positions)
-
-    # Trim to match original length
-    offset_positions = offset_positions[:len(positions)]
 
     animate_object(trail_ball, offset_positions, start_frame)
 

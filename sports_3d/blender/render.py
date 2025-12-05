@@ -5,8 +5,9 @@ Configures EEVEE render engine settings for real-time preview
 and final rendering.
 """
 
-import bpy
 from typing import Optional
+
+import bpy
 
 from .config import BlenderConfig
 
@@ -46,12 +47,6 @@ def configure_eevee(config: BlenderConfig, num_frames: int) -> None:
     scene.eevee.use_gtao = config.use_ambient_occlusion
     if config.use_ambient_occlusion:
         scene.eevee.gtao_distance = 0.5
-
-    # Bloom
-    scene.eevee.use_bloom = config.use_bloom
-    if config.use_bloom:
-        scene.eevee.bloom_intensity = config.bloom_intensity
-        scene.eevee.bloom_threshold = 0.8
 
 
 def set_output_path(

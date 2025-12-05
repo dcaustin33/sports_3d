@@ -5,9 +5,10 @@ Functions for creating various types of materials for the tennis
 court visualization.
 """
 
-import bpy
 import math
 from typing import Tuple
+
+import bpy
 
 
 def create_solid_material(

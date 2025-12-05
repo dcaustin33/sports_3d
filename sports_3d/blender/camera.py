@@ -5,9 +5,11 @@ Creates and configures cameras including the main camera and
 various preset viewing angles.
 """
 
-import bpy
 import math
 from typing import List, Tuple
+
+import bpy
+from mathutils import Vector
 
 from .config import BlenderConfig
 
@@ -29,7 +31,6 @@ def create_camera(
     Returns:
         Camera object
     """
-    from mathutils import Vector
 
     bpy.ops.object.camera_add(location=position)
     camera = bpy.context.active_object

@@ -6,29 +6,10 @@ for use in Blender animations.
 """
 
 import json
-import re
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
-
-def parse_frame_identifier(filename: str) -> Tuple[str, int, float]:
-    """Extract frame info from filename.
-
-    Args:
-        filename: Filename like 'frame_004140_t69.000s_trajectory.json'
-
-    Returns:
-        Tuple of (base_name, frame_number, timestamp_seconds)
-    """
-    base_match = re.search(r'(frame_\d+_t[\d.]+s)', filename)
-    frame_match = re.search(r'frame_(\d+)', filename)
-    time_match = re.search(r't([\d.]+)s', filename)
-
-    base = base_match.group(1) if base_match else filename
-    frame_num = int(frame_match.group(1)) if frame_match else 0
-    timestamp = float(time_match.group(1)) if time_match else 0.0
-
-    return base, frame_num, timestamp
+from sports_3d.utils.file_utils import parse_frame_identifier
 
 
 def load_trajectory_data(trajectory_dir: str) -> Tuple[List[dict], List[Tuple[float, float, float]]]:
@@ -59,7 +40,10 @@ def load_trajectory_data(trajectory_dir: str) -> Tuple[List[dict], List[Tuple[fl
         with open(file_path) as f:
             data = json.load(f)
 
-        _, frame_num, timestamp = parse_frame_identifier(file_path.name)
+        parsed = parse_frame_identifier(file_path.name)
+        if parsed is None:
+            continue
+        _, frame_num, timestamp = parsed
 
         # Get filtered position (preferred) or raw position
         filtered = data.get("filtered_projections", {})

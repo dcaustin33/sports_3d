@@ -11,16 +11,18 @@ Coordinate System:
     - Z-axis: Along court (baseline to baseline)
 """
 
-import bpy
 import math
 from typing import List, Tuple
 
+import bpy
+from mathutils import Vector
+
 from .config import BlenderConfig
 from .materials import (
-    create_textured_court_material,
     create_line_material,
-    create_transparent_material,
     create_solid_material,
+    create_textured_court_material,
+    create_transparent_material,
 )
 
 
@@ -142,8 +144,6 @@ def create_court_line(
     Returns:
         Line mesh object
     """
-    from mathutils import Vector
-
     start_vec = Vector(start)
     end_vec = Vector(end)
 
