@@ -20,6 +20,37 @@ from sports_3d.assets_3d.tennis_court import TennisCourt3D
 from sports_3d.utils.file_utils import discover_files_by_pattern, parse_frame_identifier
 
 
+def normalize_camera_position(
+    position_m: Tuple[float, float, float],
+    court_bounds_m: Tuple[float, float, float] = (11.0, 5.0, 24.0),
+) -> dict:
+    """Convert camera position in meters to Plotly normalized coordinates.
+
+    Plotly's camera 'eye' uses normalized coordinates relative to the scene bounds.
+    This function converts a position in meters to the normalized system.
+
+    Args:
+        position_m: Camera position in meters (x, y, z)
+        court_bounds_m: Scene bounds in meters (x_max, y_max, z_max) for normalization
+
+    Returns:
+        Dictionary with 'eye', 'center', and 'up' for Plotly camera
+    """
+    x_m, y_m, z_m = position_m
+    x_bound, y_bound, z_bound = court_bounds_m
+
+    # Normalize to [-1, 1] range based on court bounds
+    eye_x = x_m / x_bound
+    eye_y = y_m / y_bound
+    eye_z = z_m / z_bound
+
+    return {
+        "eye": dict(x=eye_x, y=eye_y, z=eye_z),
+        "center": dict(x=0, y=0, z=0),
+        "up": dict(x=0, y=1, z=0),
+    }
+
+
 def load_trajectory_data(trajectory_dir: Path) -> Tuple[List[dict], np.ndarray]:
     """Load all trajectory JSONs and extract filtered positions.
 
@@ -60,10 +91,14 @@ def load_trajectory_data(trajectory_dir: Path) -> Tuple[List[dict], np.ndarray]:
     return metadata_list, np.array(positions)
 
 
+
+
 def create_trajectory_figure(
     positions: np.ndarray,
     metadata: List[dict],
     tail_length: int = 10,
+    runoff_back: float = 6.4,
+    camera_position_m: Optional[Tuple[float, float, float]] = None,
 ) -> go.Figure:
     """Create Plotly figure with animation frames for trajectory.
 
@@ -71,12 +106,14 @@ def create_trajectory_figure(
         positions: Ball positions, shape (N, 3)
         metadata: List of frame metadata dicts
         tail_length: Number of trailing positions to show
+        runoff_back: Distance behind baseline (default 6.4m, ITF minimum)
+        camera_position_m: Optional camera position in meters (x, y, z)
 
     Returns:
         Plotly Figure with slider
     """
     court = TennisCourt3D(include_doubles=True)
-    fig = court.to_plotly_figure()
+    fig = court.to_plotly_figure(runoff_back=runoff_back)
 
     n_frames = len(positions)
 
@@ -154,6 +191,17 @@ def create_trajectory_figure(
         for trace in frames[0].data:
             fig.add_trace(trace)
 
+    # Set camera configuration
+    if camera_position_m is not None:
+        camera_config = normalize_camera_position(camera_position_m)
+    else:
+        # Default camera position (roughly -8.8m, 0.5m, -43.2m in world coords)
+        camera_config = {
+            "eye": dict(x=-0.8, y=0.1, z=-1.8),
+            "center": dict(x=0, y=0, z=0),
+            "up": dict(x=0, y=1, z=0),
+        }
+
     # Add slider
     fig.update_layout(
         sliders=[
@@ -175,13 +223,7 @@ def create_trajectory_figure(
             }
         ],
         title=f"Ball Trajectory ({n_frames} frames)",
-        scene=dict(
-            camera=dict(
-                eye=dict(x=-0.8, y=0.1, z=-1.8),
-                center=dict(x=0, y=0.5, z=0),
-                up=dict(x=0, y=1, z=0),
-            )
-        ),
+        scene=dict(camera=camera_config),
     )
 
     return fig
@@ -215,6 +257,30 @@ def main():
         default=1.0,
         help="Scale factor for Y axis (e.g., 2.0 to double height)",
     )
+    parser.add_argument(
+        "--runoff_back",
+        type=float,
+        default=6.4,
+        help="Distance behind baseline in meters (default 6.4m, ITF minimum)",
+    )
+    parser.add_argument(
+        "--camera_x",
+        type=float,
+        default=None,
+        help="Camera X position in meters",
+    )
+    parser.add_argument(
+        "--camera_y",
+        type=float,
+        default=None,
+        help="Camera Y position in meters",
+    )
+    parser.add_argument(
+        "--camera_z",
+        type=float,
+        default=None,
+        help="Camera Z position in meters",
+    )
 
     args = parser.parse_args()
 
@@ -234,8 +300,16 @@ def main():
         positions[:, 1] = positions[:, 1] * args.y_scale
         print(f"Scaled Y axis by {args.y_scale}x")
 
+    # Set camera position if provided
+    camera_position_m = None
+    if all(v is not None for v in [args.camera_x, args.camera_y, args.camera_z]):
+        camera_position_m = (args.camera_x, args.camera_y, args.camera_z)
+        print(f"Camera position: ({args.camera_x}, {args.camera_y}, {args.camera_z}) meters")
+
     print("Creating visualization...")
-    fig = create_trajectory_figure(positions, metadata, args.tail_length)
+    fig = create_trajectory_figure(
+        positions, metadata, args.tail_length, args.runoff_back, camera_position_m
+    )
 
     output_path = args.output or args.trajectory_dir / "trajectory_3d.html"
     fig.write_html(str(output_path))

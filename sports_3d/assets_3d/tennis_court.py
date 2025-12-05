@@ -219,8 +219,8 @@ class TennisCourt3D:
         return outer, inner
 
     def to_plotly_figure(self,
-                         inner_color: str = "#1A4B8C",  # Darker blue (inside lines)
-                         outer_color: str = "#5BA3E0",  # Lighter blue (surround)
+                         inner_color: str = "#0D3B66",  # Darker blue (inside lines)
+                         outer_color: str = "#7AB8E8",  # Lighter blue (surround)
                          line_width: float = 4,
                          show_surface: bool = True,
                          runoff_back: float = 6.4,
@@ -341,27 +341,38 @@ class TennisCourt3D:
         outer_hx = d.half_doubles_width + runoff_side
         outer_hz = d.half_length + runoff_back
 
+        # Calculate axis ranges
+        x_range = outer_hx + 1
+        z_range = outer_hz + 1
+        y_max = 5  # Max height for ball trajectory viewing
+
         fig.update_layout(
             scene=dict(
                 xaxis=dict(
                     title="X (across court) [m]",
-                    range=[-outer_hx - 1, outer_hx + 1],
+                    range=[-x_range, x_range],
                     showgrid=True,
                     gridcolor='lightgray',
                 ),
                 yaxis=dict(
                     title="Y (height) [m]",
-                    range=[-1, 3],
+                    range=[-0.1, y_max],
                     showgrid=True,
                     gridcolor='lightgray',
                 ),
                 zaxis=dict(
                     title="Z (along court) [m]",
-                    range=[-outer_hz - 1, outer_hz + 1],
+                    range=[-z_range, z_range],
                     showgrid=True,
                     gridcolor='lightgray',
                 ),
-                aspectmode='data',
+                # Use manual aspect ratio so Y isn't squished at court level
+                aspectmode='manual',
+                aspectratio=dict(
+                    x=x_range / z_range,  # Scale X relative to Z
+                    y=y_max / z_range,    # Scale Y relative to Z (makes Y visible)
+                    z=1.0,                # Z is the reference
+                ),
                 bgcolor='#1a1a2e',
             ),
             title="Tennis Court - Origin at Net Center",

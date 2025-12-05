@@ -4,7 +4,7 @@ Trajectory smoothing for 3D sports tracking.
 This module provides physics-aware filtering for noisy 3D trajectory measurements:
 - Z-axis (depth): Exponential decay model anchored at event endpoints (monotonic)
 - X-axis (lateral): Quadratic fit anchored at endpoints (allows spin curve, no weaving)
-- Y-axis (vertical): Savitzky-Golay polynomial smoothing
+- Y-axis (vertical): Ballistic model anchored at event endpoints (single parabola)
 - Automatic detection of velocity discontinuities (bounces, hits)
 - Adaptive measurement uncertainty based on reprojection error
 
@@ -179,8 +179,8 @@ class TrajectoryFilter:
     Combined filter for 3D trajectory data.
 
     Uses exponential decay model for Z-axis (monotonic), quadratic fit for X-axis
-    (single curve, no weaving), and polynomial smoothing for Y-axis.
-    Event positions anchor segment endpoints for X and Z.
+    (single curve, no weaving), and ballistic model for Y-axis.
+    Event positions anchor segment endpoints for X, Y, and Z.
     """
 
     def __init__(
@@ -285,6 +285,91 @@ class TrajectoryFilter:
                 print(f"  Segment [{start}, {end}): X quadratic fit (curvature a={a:.4f})")
 
         return x_filtered
+
+    def _apply_y_ballistic(
+        self,
+        timestamps: np.ndarray,
+        y_positions: np.ndarray,
+        uncertainties: np.ndarray,
+        segments: List[Tuple[int, int]]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply ballistic model to Y-axis per-segment, anchored at endpoints.
+
+        Physics model: Ball vertical motion under effective gravity.
+        y(t) = y_start + v_y0*t - (1/2)*g_eff*t²
+        v(t) = v_y0 - g_eff*t
+
+        The model is anchored at segment endpoints (event positions are ground truth).
+        This guarantees single-parabola motion between events (no multi-peak artifacts).
+
+        Args:
+            timestamps: (N,) array of timestamps in seconds
+            y_positions: (N,) array of Y positions in meters
+            uncertainties: (N,) array of measurement uncertainties in meters
+            segments: List of (start_idx, end_idx) for continuous segments
+
+        Returns:
+            y_filtered: (N,) filtered Y positions
+            y_velocity: (N,) estimated Y velocities
+        """
+        n = len(timestamps)
+        y_filtered = np.copy(y_positions)
+        y_velocity = np.zeros(n)
+
+        for start, end in segments:
+            segment_length = end - start
+
+            if segment_length < 2:
+                continue
+
+            if segment_length == 2:
+                dt = timestamps[start + 1] - timestamps[start]
+                if dt > 0:
+                    v = (y_positions[start + 1] - y_positions[start]) / dt
+                    y_velocity[start] = v
+                    y_velocity[start + 1] = v
+                continue
+
+            t_seg = timestamps[start:end]
+            y_seg = y_positions[start:end]
+
+            t_rel = t_seg - t_seg[0]
+            T = t_rel[-1]
+
+            y_start = y_seg[0]
+            y_end = y_seg[-1]
+            delta_y = y_end - y_start
+
+            if abs(delta_y) < 1e-6:
+                y_filtered[start:end] = y_start
+                y_velocity[start:end] = 0.0
+                continue
+
+            g_eff = self._fit_gravity_constant(
+                t_rel, y_seg, y_start, delta_y, T, uncertainties[start:end]
+            )
+
+            if g_eff > 1e-6:
+                v_y0 = delta_y / T + 0.5 * g_eff * T
+
+                y_fit = y_start + v_y0 * t_rel - 0.5 * g_eff * (t_rel ** 2)
+                v_fit = v_y0 - g_eff * t_rel
+            else:
+                v_const = delta_y / T
+                y_fit = y_start + v_const * t_rel
+                v_fit = np.full_like(t_rel, v_const)
+
+            y_filtered[start:end] = y_fit
+            y_velocity[start:end] = v_fit
+
+            if self.verbose:
+                v_start = v_fit[0]
+                v_end = v_fit[-1]
+                print(f"  Segment [{start}, {end}): Ballistic fit "
+                      f"(g_eff={g_eff:.3f} m/s², v_start={v_start:.2f} m/s, v_end={v_end:.2f} m/s)")
+
+        return y_filtered, y_velocity
 
     def _apply_z_exponential_decay(
         self,
@@ -434,6 +519,66 @@ class TrajectoryFilter:
 
         return best_k
 
+    def _fit_gravity_constant(
+        self,
+        t_rel: np.ndarray,
+        y_seg: np.ndarray,
+        y_start: float,
+        delta_y: float,
+        T: float,
+        uncertainties: np.ndarray
+    ) -> float:
+        """
+        Fit effective gravity constant g_eff using weighted least squares on interior points.
+
+        The model is: y(t) = y_start + v_y0*t - (1/2)*g_eff*t²
+        Where v_y0 = delta_y/T + (1/2)*g_eff*T (from endpoint constraint)
+
+        This is anchored at endpoints, so we fit g_eff to minimize error on interior points.
+
+        Args:
+            t_rel: Relative timestamps (starting at 0)
+            y_seg: Y positions for this segment
+            y_start: Starting Y position (anchor)
+            delta_y: Total Y displacement (y_end - y_start)
+            T: Total segment duration
+            uncertainties: Measurement uncertainties
+
+        Returns:
+            Optimal gravity constant g_eff in m/s² (0 means use linear interpolation)
+        """
+        if len(t_rel) <= 2:
+            return 0.0
+
+        interior_mask = (t_rel > 0) & (t_rel < T)
+        if not np.any(interior_mask):
+            return 0.0
+
+        t_interior = t_rel[interior_mask]
+        y_interior = y_seg[interior_mask]
+        w_interior = 1.0 / (uncertainties[interior_mask] ** 2)
+
+        best_g = 0.0
+        best_error = float('inf')
+
+        for g_eff in np.linspace(5.0, 15.0, 50):
+            v_y0 = delta_y / T + 0.5 * g_eff * T
+
+            y_pred = y_start + v_y0 * t_interior - 0.5 * g_eff * (t_interior ** 2)
+            error = np.sum(w_interior * (y_pred - y_interior) ** 2)
+
+            if error < best_error:
+                best_error = error
+                best_g = g_eff
+
+        y_linear = y_start + delta_y * t_interior / T
+        linear_error = np.sum(w_interior * (y_linear - y_interior) ** 2)
+
+        if linear_error <= best_error:
+            return 0.0
+
+        return best_g
+
     def filter(
         self,
         timestamps: np.ndarray,
@@ -457,7 +602,8 @@ class TrajectoryFilter:
                 - velocities: (N, 3) estimated velocities
                 - x_raw, y_raw, z_raw: (N,) original positions per axis
                 - x_filtered, y_filtered, z_filtered: (N,) filtered positions
-                - z_velocity: (N,) Z-axis velocity from quadratic fitting
+                - y_velocity: (N,) Y-axis velocity from ballistic fitting
+                - z_velocity: (N,) Z-axis velocity from exponential decay
                 - discontinuity_frames: Array of discontinuity indices
                 - outlier_frames: Empty list (kept for backwards compatibility)
                 - segments: List of (start, end) segment boundaries
@@ -481,6 +627,7 @@ class TrajectoryFilter:
                 'x_filtered': positions[:, 0],
                 'y_filtered': positions[:, 1],
                 'z_filtered': positions[:, 2],
+                'y_velocity': np.zeros(n),
                 'z_velocity': np.zeros(n),
                 'discontinuity_frames': discontinuity_frames,
                 'outlier_frames': [],
@@ -497,7 +644,12 @@ class TrajectoryFilter:
             uncertainties,
             segments
         )
-        y_filtered = self._apply_y_smoothing(positions[:, 1], segments)
+        y_filtered, y_velocity = self._apply_y_ballistic(
+            timestamps,
+            positions[:, 1],
+            uncertainties,
+            segments
+        )
 
         z_filtered, z_velocity = self._apply_z_exponential_decay(
             timestamps,
@@ -513,7 +665,7 @@ class TrajectoryFilter:
             dt = timestamps[i + 1] - timestamps[i - 1]
             if dt > 0:
                 velocities[i, 0] = (x_filtered[i + 1] - x_filtered[i - 1]) / dt
-                velocities[i, 1] = (y_filtered[i + 1] - y_filtered[i - 1]) / dt
+        velocities[:, 1] = y_velocity
         velocities[:, 2] = z_velocity
 
         velocities[0] = velocities[1]
@@ -529,6 +681,7 @@ class TrajectoryFilter:
             'x_filtered': x_filtered,
             'y_filtered': y_filtered,
             'z_filtered': z_filtered,
+            'y_velocity': y_velocity,
             'z_velocity': z_velocity,
             'discontinuity_frames': discontinuity_frames,
             'outlier_frames': [],
