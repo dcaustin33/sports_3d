@@ -84,6 +84,17 @@ The `BallTrackerNet` is a fully convolutional network:
   - `file_utils.py` - Shared utilities for file discovery and JSON serialization
   - `kalman.py` - Trajectory filtering implementation
 - `main.py` - Entry point (currently just prints hello world)
+- `sports_3d/blender/` - Blender visualization package:
+  - `__init__.py` - Package init with exports
+  - `config.py` - Configuration dataclass with ITF court dimensions
+  - `data_loader.py` - Trajectory JSON loading and processing
+  - `materials.py` - Blender material creation utilities
+  - `court.py` - Tennis court 3D geometry generation
+  - `ball.py` - Ball mesh, trail system, keyframe animation
+  - `camera.py` - Camera setup and presets
+  - `environment.py` - Nishita sky and lighting
+  - `render.py` - EEVEE render configuration
+  - `main.py` - Entry point for Blender script
 
 ## Dependencies
 
@@ -193,6 +204,67 @@ Common utilities for file operations and data serialization across the codebase:
 - `TIMESTAMP_PATTERN`: Regex for extracting timestamps
 
 **Usage:** Import and use these utilities when adding new file processing scripts to maintain consistency across the codebase.
+
+## Blender 3D Visualization
+
+### Overview
+The `sports_3d/blender/` package creates high-quality 3D visualizations of tennis ball trajectories in Blender. Requires Blender 4.x.
+
+### Running the Visualization
+
+**From Blender GUI:**
+1. Open Blender 4.x
+2. Go to Scripting workspace (top tab bar)
+3. Click "Open" and navigate to `sports_3d/blender/main.py`
+4. Press Alt+P or click "Run Script"
+
+**From Command Line:**
+```bash
+blender --python sports_3d/blender/main.py
+```
+
+**With Custom Parameters:**
+```bash
+blender --python sports_3d/blender/main.py -- \
+    --trajectory_dir data/sinner_ruud_trajectory \
+    --camera_z -20.0 \
+    --trail_length 20
+```
+
+### Configuration
+Edit `sports_3d/blender/config.py` to customize:
+- Camera position and FOV
+- Court colors (Australian Open blue by default)
+- Trail length and opacity
+- Render resolution and quality
+- Sky sun position
+
+### Interactive Controls
+- **Space**: Play/pause animation
+- **←/→**: Previous/next frame
+- **Shift+←/→**: Jump 10 frames
+- **Home/End**: Go to start/end
+- **Numpad 0**: Camera view
+- **N**: Toggle sidebar (switch cameras)
+- **F12**: Render current frame
+- **Ctrl+F12**: Render animation
+
+### Camera Presets
+The script creates multiple cameras for different viewing angles:
+- `MainCamera`: User's configured position (default behind baseline)
+- `Cam_BroadcastNegZ`: High broadcast angle from negative Z
+- `Cam_BroadcastPosZ`: High broadcast angle from positive Z
+- `Cam_Courtside`: Side view
+- `Cam_Overhead`: Bird's eye view
+- `Cam_NetLevel`: Low dramatic angle
+
+Switch cameras in the sidebar (N key) under Scene > Camera.
+
+### Key Technical Notes
+- Y values in trajectory data are negated during import (original calibration produces negative Y)
+- Uses EEVEE render engine for real-time preview
+- Trail balls use graduated opacity (older = more transparent)
+- Court uses procedural noise texture for subtle realism
 
 ## Coding Style Preferences
 
