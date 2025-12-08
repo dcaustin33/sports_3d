@@ -397,14 +397,18 @@ class TrajectoryFilter:
         segments: List[Tuple[int, int]],
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply ballistic model to Y-axis per-segment with fidelity blending.
+        Apply ballistic model to Y-axis per-segment with two-pass filtering.
 
         Physics model: Ball vertical motion under effective gravity.
         y(t) = y_start + v_y0*t - (1/2)*g_eff*t²
         v(t) = v_y0 - g_eff*t
 
-        After ballistic fitting, blends with raw measurements based on y_fidelity,
-        then enforces monotonic up-then-down constraint via isotonic regression.
+        Processing pipeline:
+        1. Fit ballistic model (anchored at segment endpoints)
+        2. Blend with raw measurements based on y_fidelity
+        3. Enforce monotonic trajectory (single apex via isotonic regression)
+        4. Apply Savitzky-Golay smoothing (remove high-frequency noise)
+        5. Re-enforce monotonicity (guarantee no wavering from smoothing)
 
         Args:
             timestamps: (N,) array of timestamps in seconds
@@ -455,7 +459,6 @@ class TrajectoryFilter:
                 y_velocity[start:end] = 0.0
                 continue
             
-            print(f"start: {start}, end: {end}")
             g_eff = self._fit_gravity_constant(
                 t_rel, y_seg, y_start_val, delta_y, T, uncertainties[start:end]
             )
@@ -474,7 +477,25 @@ class TrajectoryFilter:
 
             y_monotonic = _enforce_monotonic_trajectory(y_blended)
 
-            y_filtered[start:end] = y_monotonic
+            # Second pass: medium smoothing to remove high-frequency noise
+            if segment_length >= 7:
+                window = min(7, segment_length)
+                if window % 2 == 0:
+                    window -= 1
+
+                y_smoothed = savgol_filter(
+                    y_monotonic,
+                    window_length=window,
+                    polyorder=2,
+                    mode='interp'
+                )
+                # Re-enforce monotonicity after smoothing
+                y_final = _enforce_monotonic_trajectory(y_smoothed)
+            else:
+                # Segment too short for second smoothing pass
+                y_final = y_monotonic
+
+            y_filtered[start:end] = y_final
             y_velocity[start:end] = v_fit
 
             if self.verbose:
