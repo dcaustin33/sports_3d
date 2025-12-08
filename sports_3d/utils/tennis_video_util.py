@@ -128,18 +128,20 @@ def discover_video_data(frames_dir: Path, trajectory_dir: Path) -> List[FrameDat
     return frame_data_list
 
 
-def create_overlay_text(frame_data: FrameData) -> List[str]:
+def create_overlay_text(frame_data: FrameData, frame_idx: int, total_frames: int) -> List[str]:
     """
     Generate formatted text lines for frame overlay.
 
     Args:
         frame_data: Frame data with trajectory information
+        frame_idx: Current frame index (0-based)
+        total_frames: Total number of frames in sequence
 
     Returns:
         List of formatted text lines
     """
     lines = [
-        f"Frame: {frame_data.frame_number}  Time: {frame_data.timestamp:.3f}s",
+        f"Frame: {frame_data.frame_number}  Time: {frame_data.timestamp:.3f}s  ({frame_idx + 1}/{total_frames})",
         "",
         "Raw Position (m):",
         f"  X: {frame_data.raw_position[0]:7.3f}",
@@ -310,13 +312,14 @@ def create_video(
         raise RuntimeError(f"Failed to open video writer: {output_path}")
 
     try:
+        total_frames = len(frame_data_list)
         for i, frame_data in enumerate(frame_data_list):
             frame = cv2.imread(str(frame_data.image_path))
             if frame is None:
                 print(f"Warning: Could not read {frame_data.image_path}, skipping")
                 continue
 
-            text_lines = create_overlay_text(frame_data)
+            text_lines = create_overlay_text(frame_data, i, total_frames)
             frame_with_overlay = draw_overlay(frame, text_lines, overlay_position)
 
             writer.write(frame_with_overlay)

@@ -102,6 +102,106 @@ def _detect_discontinuities(
     return discontinuity_indices, valid_segments
 
 
+def _isotonic_increasing(y: np.ndarray) -> np.ndarray:
+    """
+    Pool Adjacent Violators algorithm for non-decreasing constraint.
+
+    Finds the closest non-decreasing sequence to input by averaging violations.
+
+    Args:
+        y: Input array
+
+    Returns:
+        Non-decreasing array closest to y (minimizes squared error)
+    """
+    result = np.copy(y).astype(float)
+    n = len(result)
+    if n <= 1:
+        return result
+
+    i = 0
+    while i < n - 1:
+        if result[i] > result[i + 1]:
+            j = i + 1
+            while j < n and result[j] < result[j - 1]:
+                j += 1
+            block_start = i
+            while block_start > 0 and result[block_start - 1] > result[j - 1]:
+                block_start -= 1
+            avg = np.mean(result[block_start:j])
+            result[block_start:j] = avg
+            i = block_start
+        else:
+            i += 1
+
+    return result
+
+
+def _isotonic_decreasing(y: np.ndarray) -> np.ndarray:
+    """
+    Pool Adjacent Violators algorithm for non-increasing constraint.
+
+    Args:
+        y: Input array
+
+    Returns:
+        Non-increasing array closest to y (minimizes squared error)
+    """
+    return -_isotonic_increasing(-y)
+
+
+def _enforce_monotonic_trajectory(y_values: np.ndarray) -> np.ndarray:
+    """
+    Enforce single-apex trajectory using isotonic regression.
+
+    For a ball trajectory, there should be at most one direction change:
+    - Rising then falling (standard physics: Y increases upward)
+    - OR falling then rising (inverted coords: Y increases downward, like this codebase)
+
+    This function tries both patterns and picks the one with lower error.
+
+    Args:
+        y_values: Input Y positions
+
+    Returns:
+        Y positions with single-apex constraint enforced
+    """
+    n = len(y_values)
+    if n < 3:
+        return y_values.copy()
+
+    def fit_apex_max(apex_idx: int) -> np.ndarray:
+        """Fit increasing-then-decreasing (apex is maximum)."""
+        y_result = np.copy(y_values)
+        if apex_idx > 0:
+            y_result[:apex_idx + 1] = _isotonic_increasing(y_values[:apex_idx + 1])
+        if apex_idx < n - 1:
+            y_result[apex_idx:] = _isotonic_decreasing(y_values[apex_idx:])
+        return y_result
+
+    def fit_apex_min(apex_idx: int) -> np.ndarray:
+        """Fit decreasing-then-increasing (apex is minimum, for inverted Y)."""
+        y_result = np.copy(y_values)
+        if apex_idx > 0:
+            y_result[:apex_idx + 1] = _isotonic_decreasing(y_values[:apex_idx + 1])
+        if apex_idx < n - 1:
+            y_result[apex_idx:] = _isotonic_increasing(y_values[apex_idx:])
+        return y_result
+
+    best_error = float('inf')
+    best_result = y_values.copy()
+
+    for apex_idx in range(n):
+        for fit_func in [fit_apex_max, fit_apex_min]:
+            y_fitted = fit_func(apex_idx)
+            error = np.sum((y_fitted - y_values) ** 2)
+            if error < best_error:
+                best_error = error
+                best_result = y_fitted
+
+    return best_result
+
+
 class PolynomialSmoother:
     """
     Savitzky-Golay polynomial smoothing for X/Y trajectory components.
@@ -187,6 +287,7 @@ class TrajectoryFilter:
         self,
         window_size_xy: int = 7,
         poly_order: int = 2,
+        y_fidelity: float = 0.5,
         verbose: bool = False
     ):
         """
@@ -195,9 +296,11 @@ class TrajectoryFilter:
         Args:
             window_size_xy: Smoothing window size for X/Y axes
             poly_order: Polynomial order for X/Y smoothing
+            y_fidelity: Blend factor for Y-axis (0.0 = pure ballistic, 1.0 = pure raw)
             verbose: Enable debug output
         """
         self.verbose = verbose
+        self.y_fidelity = y_fidelity
         self.poly_smoother = PolynomialSmoother(window_size_xy, poly_order)
 
     def _apply_y_smoothing(
@@ -291,17 +394,17 @@ class TrajectoryFilter:
         timestamps: np.ndarray,
         y_positions: np.ndarray,
         uncertainties: np.ndarray,
-        segments: List[Tuple[int, int]]
+        segments: List[Tuple[int, int]],
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply ballistic model to Y-axis per-segment, anchored at endpoints.
+        Apply ballistic model to Y-axis per-segment with fidelity blending.
 
         Physics model: Ball vertical motion under effective gravity.
         y(t) = y_start + v_y0*t - (1/2)*g_eff*t²
         v(t) = v_y0 - g_eff*t
 
-        The model is anchored at segment endpoints (event positions are ground truth).
-        This guarantees single-parabola motion between events (no multi-peak artifacts).
+        After ballistic fitting, blends with raw measurements based on y_fidelity,
+        then enforces monotonic up-then-down constraint via isotonic regression.
 
         Args:
             timestamps: (N,) array of timestamps in seconds
@@ -316,6 +419,12 @@ class TrajectoryFilter:
         n = len(timestamps)
         y_filtered = np.copy(y_positions)
         y_velocity = np.zeros(n)
+        
+        flipped_y = False
+        if np.mean(y_positions) < 0:
+            # need to flip for gravity filtering
+            y_positions = -y_positions
+            flipped_y = True
 
         for start, end in segments:
             segment_length = end - start
@@ -337,37 +446,47 @@ class TrajectoryFilter:
             t_rel = t_seg - t_seg[0]
             T = t_rel[-1]
 
-            y_start = y_seg[0]
-            y_end = y_seg[-1]
-            delta_y = y_end - y_start
+            y_start_val = y_seg[0]
+            y_end_val = y_seg[-1]
+            delta_y = y_end_val - y_start_val
 
             if abs(delta_y) < 1e-6:
-                y_filtered[start:end] = y_start
+                y_filtered[start:end] = y_start_val
                 y_velocity[start:end] = 0.0
                 continue
-
+            
+            print(f"start: {start}, end: {end}")
             g_eff = self._fit_gravity_constant(
-                t_rel, y_seg, y_start, delta_y, T, uncertainties[start:end]
+                t_rel, y_seg, y_start_val, delta_y, T, uncertainties[start:end]
             )
 
             if g_eff > 1e-6:
                 v_y0 = delta_y / T + 0.5 * g_eff * T
 
-                y_fit = y_start + v_y0 * t_rel - 0.5 * g_eff * (t_rel ** 2)
+                y_ballistic = y_start_val + v_y0 * t_rel - 0.5 * g_eff * (t_rel ** 2)
                 v_fit = v_y0 - g_eff * t_rel
             else:
                 v_const = delta_y / T
-                y_fit = y_start + v_const * t_rel
+                y_ballistic = y_start_val + v_const * t_rel
                 v_fit = np.full_like(t_rel, v_const)
 
-            y_filtered[start:end] = y_fit
+            y_blended = (1 - self.y_fidelity) * y_ballistic + self.y_fidelity * y_seg
+
+            y_monotonic = _enforce_monotonic_trajectory(y_blended)
+
+            y_filtered[start:end] = y_monotonic
             y_velocity[start:end] = v_fit
 
             if self.verbose:
                 v_start = v_fit[0]
                 v_end = v_fit[-1]
                 print(f"  Segment [{start}, {end}): Ballistic fit "
-                      f"(g_eff={g_eff:.3f} m/s², v_start={v_start:.2f} m/s, v_end={v_end:.2f} m/s)")
+                      f"(g_eff={g_eff:.3f} m/s², v_start={v_start:.2f} m/s, "
+                      f"v_end={v_end:.2f} m/s, fidelity={self.y_fidelity:.2f})")
+
+        if flipped_y:
+            y_filtered = -y_filtered
+            y_velocity = -y_velocity
 
         return y_filtered, y_velocity
 
@@ -561,7 +680,7 @@ class TrajectoryFilter:
         best_g = 0.0
         best_error = float('inf')
 
-        for g_eff in np.linspace(5.0, 15.0, 50):
+        for g_eff in np.linspace(2.0, 25.0, 100):
             v_y0 = delta_y / T + 0.5 * g_eff * T
 
             y_pred = y_start + v_y0 * t_interior - 0.5 * g_eff * (t_interior ** 2)
@@ -571,11 +690,8 @@ class TrajectoryFilter:
                 best_error = error
                 best_g = g_eff
 
-        y_linear = y_start + delta_y * t_interior / T
-        linear_error = np.sum(w_interior * (y_linear - y_interior) ** 2)
-
-        if linear_error <= best_error:
-            return 0.0
+        if best_g < 5.0:
+            best_g = 5.0
 
         return best_g
 
